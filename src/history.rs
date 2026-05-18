@@ -45,6 +45,132 @@ pub fn append(path: &Path, rec: &TickRecord) -> Result<()> {
     Ok(())
 }
 
+/// Rotate `path` if it has more than `max_lines` lines: keeps the newest
+/// `max_lines` in place and moves the previous file to `path.1` (overwriting
+/// any older rotation). Returns true if rotation happened. 0 = disabled.
+///
+/// This is what keeps `history.jsonl` from growing unbounded: at one tick per
+/// minute × N memory roots, the file otherwise accumulates forever.
+pub fn rotate_if_oversize(path: &Path, max_lines: u64) -> Result<bool> {
+    if max_lines == 0 {
+        return Ok(false);
+    }
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return Ok(false);
+    };
+    let lines: Vec<&str> = body.lines().collect();
+    let n = lines.len() as u64;
+    if n <= max_lines {
+        return Ok(false);
+    }
+    // Keep newest `max_lines` in place.
+    let keep_from = lines.len().saturating_sub(max_lines as usize);
+    let mut kept = lines[keep_from..].join("\n");
+    if !kept.is_empty() {
+        kept.push('\n');
+    }
+    // Move pre-rotation copy to `.1` (a single rotation slot keeps disk
+    // bounded; older history is intentionally discarded).
+    let backup = path.with_extension(
+        path.extension()
+            .map(|e| format!("{}.1", e.to_string_lossy()))
+            .unwrap_or_else(|| "1".to_string()),
+    );
+    let tmp = path.with_extension("rot.tmp");
+    std::fs::write(&tmp, kept).with_context(|| format!("write {}", tmp.display()))?;
+    let _ = std::fs::rename(path, &backup);
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename to {}", path.display()))?;
+    Ok(true)
+}
+
+/// Delete `/tmp/cmmd-tick-*.log` files older than `ttl_days`. Returns the
+/// number of files removed. 0 = disabled. This is the *biggest* disk eater
+/// of the three growth sources because per-tick agent transcripts are large.
+pub fn sweep_tick_logs(ttl_days: u64) -> usize {
+    if ttl_days == 0 {
+        return 0;
+    }
+    let dir = std::path::Path::new("/tmp");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let cutoff = SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(ttl_days * 86_400))
+        .unwrap_or(UNIX_EPOCH);
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        if !name_s.starts_with("cmmd-tick-") || !name_s.ends_with(".log") {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if mtime < cutoff && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Run `git gc --prune=now --aggressive` over `memory_root` if it's a git
+/// repo and the marker file says we haven't gc'd in `interval_days`. Best
+/// effort — failures are logged by the caller, never fatal. The marker lives
+/// inside `.git/cmmd-last-gc` so it travels with the repo.
+pub fn git_gc_if_due(memory_root: &Path, interval_days: u64) -> Result<bool> {
+    if interval_days == 0 {
+        return Ok(false);
+    }
+    let git_dir = memory_root.join(".git");
+    if !git_dir.exists() {
+        return Ok(false);
+    }
+    let marker = git_dir.join("cmmd-last-gc");
+    let now = now_unix();
+    let interval = interval_days.saturating_mul(86_400);
+    if let Ok(prev) = std::fs::read_to_string(&marker) {
+        if let Ok(prev_unix) = prev.trim().parse::<u64>() {
+            if now.saturating_sub(prev_unix) < interval {
+                return Ok(false);
+            }
+        }
+    }
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(memory_root)
+        .arg("gc")
+        .arg("--prune=now")
+        .arg("--quiet")
+        .status()
+        .context("git gc")?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("git gc failed"));
+    }
+    let _ = std::fs::write(&marker, now.to_string());
+    Ok(true)
+}
+
+/// Count files in `memory_root`'s working tree that differ from HEAD. Used
+/// to enforce MAX_FIXES_PER_TICK: if the agent edited more files than the
+/// allowed cap, the caller can `restore(pre_sha)` to roll the lot back.
+pub fn count_dirty_files(memory_root: &Path) -> Result<usize> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(memory_root)
+        .arg("status")
+        .arg("--porcelain")
+        .output()
+        .context("git status --porcelain")?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!("git status failed"));
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    Ok(body.lines().filter(|l| !l.trim().is_empty()).count())
+}
+
 /// Read the last `n` records (newest first). Cheap for typical n; we read the
 /// whole file and slice — tick-report.jsonl is rarely huge.
 pub fn tail(path: &Path, n: usize) -> Vec<TickRecord> {
@@ -277,5 +403,61 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let b = new_tick_id();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn rotate_keeps_newest_lines_and_writes_backup() {
+        let dir = unique_tmp("rotate");
+        let log = dir.join("ticks.jsonl");
+        for i in 0..10 {
+            append(&log, &sample_rec(&format!("t{i}"))).unwrap();
+        }
+        let rotated = rotate_if_oversize(&log, 4).unwrap();
+        assert!(rotated, "should have rotated");
+        // The newest 4 must remain.
+        let after = std::fs::read_to_string(&log).unwrap();
+        let kept_lines: Vec<&str> = after.lines().collect();
+        assert_eq!(kept_lines.len(), 4);
+        assert!(kept_lines[3].contains("\"t9\""), "newest line preserved");
+        // Backup exists.
+        let backup = dir.join("ticks.jsonl.1");
+        assert!(backup.exists(), "backup file written");
+    }
+
+    #[test]
+    fn rotate_below_threshold_is_a_noop() {
+        let dir = unique_tmp("rotate-below");
+        let log = dir.join("ticks.jsonl");
+        append(&log, &sample_rec("only")).unwrap();
+        let rotated = rotate_if_oversize(&log, 10).unwrap();
+        assert!(!rotated);
+    }
+
+    #[test]
+    fn rotate_disabled_with_zero_max() {
+        let dir = unique_tmp("rotate-zero");
+        let log = dir.join("ticks.jsonl");
+        for i in 0..5 {
+            append(&log, &sample_rec(&format!("z{i}"))).unwrap();
+        }
+        assert!(!rotate_if_oversize(&log, 0).unwrap());
+    }
+
+    #[test]
+    fn sweep_tick_logs_ignores_recent_files() {
+        // Create a fresh file in /tmp matching the pattern; sweeper must
+        // not touch it because mtime is "now".
+        let p = std::env::temp_dir()
+            .join(format!("cmmd-tick-roundtrip-{}.log", std::process::id()));
+        std::fs::write(&p, "x").unwrap();
+        let removed = sweep_tick_logs(7);
+        assert!(p.exists(), "fresh transcript must survive sweep");
+        let _ = std::fs::remove_file(&p);
+        let _ = removed;
+    }
+
+    #[test]
+    fn sweep_tick_logs_disabled_with_zero_ttl() {
+        assert_eq!(sweep_tick_logs(0), 0);
     }
 }

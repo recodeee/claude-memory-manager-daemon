@@ -20,6 +20,17 @@ pub struct Metrics {
     pub audit_issues_last: AtomicU64,
     pub history_appends_total: AtomicU64,
     pub last_tick_unix: AtomicU64,
+    // Growth-control counters. These exist so a runaway daemon is visible in
+    // Prometheus before it eats the disk: if `history_rotations_total` is
+    // climbing fast, ticks are running far too often.
+    pub history_rotations_total: AtomicU64,
+    pub tick_logs_swept_total: AtomicU64,
+    pub git_gc_runs_total: AtomicU64,
+    // Budget-cap counters. Each increment means the daemon refused to spend
+    // tokens it would otherwise have spent — i.e. saved you from a bill.
+    pub ticks_blocked_daily_cap_total: AtomicU64,
+    pub ticks_reverted_fix_cap_total: AtomicU64,
+    pub day_ticks_ran: AtomicU64,
 }
 
 impl Metrics {
@@ -51,6 +62,32 @@ impl Metrics {
 
     pub fn record_history_append(&self) {
         self.history_appends_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_history_rotation(&self) {
+        self.history_rotations_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_tick_logs_swept(&self, n: u64) {
+        self.tick_logs_swept_total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn record_git_gc(&self) {
+        self.git_gc_runs_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_daily_cap_block(&self) {
+        self.ticks_blocked_daily_cap_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_fix_cap_revert(&self) {
+        self.ticks_reverted_fix_cap_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_day_ticks_ran(&self, n: u64) {
+        self.day_ticks_ran.store(n, Ordering::Relaxed);
     }
 
     /// `tick_interval_sec` lets the exporter publish a derived gauge for
@@ -124,6 +161,42 @@ impl Metrics {
         out.push_str("# HELP cmmd_tick_staleness_seconds Seconds since the last tick (helps spot a stuck daemon).\n");
         out.push_str("# TYPE cmmd_tick_staleness_seconds gauge\n");
         out.push_str(&format!("cmmd_tick_staleness_seconds {}\n", staleness));
+        out.push_str("# HELP cmmd_history_rotations_total history.jsonl rotations performed.\n");
+        out.push_str("# TYPE cmmd_history_rotations_total counter\n");
+        out.push_str(&format!(
+            "cmmd_history_rotations_total {}\n",
+            self.history_rotations_total.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP cmmd_tick_logs_swept_total Per-tick agent transcript files deleted by TTL sweeper.\n");
+        out.push_str("# TYPE cmmd_tick_logs_swept_total counter\n");
+        out.push_str(&format!(
+            "cmmd_tick_logs_swept_total {}\n",
+            self.tick_logs_swept_total.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP cmmd_git_gc_runs_total git gc invocations across MEMORY_ROOTS.\n");
+        out.push_str("# TYPE cmmd_git_gc_runs_total counter\n");
+        out.push_str(&format!(
+            "cmmd_git_gc_runs_total {}\n",
+            self.git_gc_runs_total.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP cmmd_ticks_blocked_daily_cap_total Ticks aborted because MAX_TICKS_PER_DAY was reached.\n");
+        out.push_str("# TYPE cmmd_ticks_blocked_daily_cap_total counter\n");
+        out.push_str(&format!(
+            "cmmd_ticks_blocked_daily_cap_total {}\n",
+            self.ticks_blocked_daily_cap_total.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP cmmd_ticks_reverted_fix_cap_total Ticks rolled back because the agent exceeded MAX_FIXES_PER_TICK.\n");
+        out.push_str("# TYPE cmmd_ticks_reverted_fix_cap_total counter\n");
+        out.push_str(&format!(
+            "cmmd_ticks_reverted_fix_cap_total {}\n",
+            self.ticks_reverted_fix_cap_total.load(Ordering::Relaxed)
+        ));
+        out.push_str("# HELP cmmd_day_ticks_ran Ticks ran today (UTC). Resets at midnight.\n");
+        out.push_str("# TYPE cmmd_day_ticks_ran gauge\n");
+        out.push_str(&format!(
+            "cmmd_day_ticks_ran {}\n",
+            self.day_ticks_ran.load(Ordering::Relaxed)
+        ));
         out
     }
 }
