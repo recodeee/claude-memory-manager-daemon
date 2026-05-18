@@ -210,13 +210,19 @@ async fn run_daemon(cfg: config::Config, once: bool) -> Result<()> {
         config: serde_json::to_value(&cfg)?,
     };
     let state = Arc::new(RwLock::new(status));
+    let tick_now = Arc::new(tokio::sync::Notify::new());
+    let dry_run_runtime = Arc::new(tokio::sync::Mutex::new(cfg.dry_run));
 
     // Status socket.
     {
         let sock = cfg.status_sock.clone();
-        let st = state.clone();
+        let handles = ipc::DaemonHandles {
+            state: state.clone(),
+            tick_now: tick_now.clone(),
+            dry_run: dry_run_runtime.clone(),
+        };
         tokio::spawn(async move {
-            if let Err(e) = ipc::serve_status(sock, st).await {
+            if let Err(e) = ipc::serve_status(sock, handles).await {
                 error!("status server died: {e}");
             }
         });
@@ -226,7 +232,14 @@ async fn run_daemon(cfg: config::Config, once: bool) -> Result<()> {
     let shutdown = tokio::spawn(install_signal_handler());
 
     let cfg_arc = Arc::new(cfg);
-    let result = main_loop(cfg_arc.clone(), state.clone(), once, shutdown).await;
+    let result = main_loop(
+        cfg_arc.clone(),
+        state.clone(),
+        tick_now.clone(),
+        dry_run_runtime.clone(),
+        once,
+        shutdown,
+    ).await;
 
     ipc::release_lock(&cfg_arc.lock_file, &cfg_arc.pid_file);
     info!("daemon down");
@@ -236,6 +249,8 @@ async fn run_daemon(cfg: config::Config, once: bool) -> Result<()> {
 async fn main_loop(
     cfg: Arc<config::Config>,
     state: Arc<RwLock<ipc::DaemonStatus>>,
+    tick_now: Arc<tokio::sync::Notify>,
+    dry_run_runtime: Arc<tokio::sync::Mutex<bool>>,
     once: bool,
     mut shutdown: tokio::task::JoinHandle<()>,
 ) -> Result<()> {
@@ -255,7 +270,11 @@ async fn main_loop(
         }
         log_login_summary(&am, &accts);
 
-        let outcome = match tick::run(&cfg, &mem).await {
+        let dry_run_now = *dry_run_runtime.lock().await;
+        // Reflect runtime override into the published status so mmctl sees it.
+        state.write().await.dry_run = dry_run_now;
+
+        let outcome = match tick::run(&cfg, dry_run_now, &mem).await {
             Ok(o) => o,
             Err(e) => {
                 error!("tick error: {e:#}");
@@ -281,8 +300,11 @@ async fn main_loop(
             return Ok(());
         }
 
+        // Sleep until the next scheduled tick, OR until someone pokes us via
+        // `mmctl tick`, OR until we get SIGTERM.
         tokio::select! {
             _ = tokio::time::sleep(cfg.tick_interval) => {}
+            _ = tick_now.notified() => { info!("tick requested via socket"); }
             _ = &mut shutdown => {
                 info!("shutdown signal received");
                 return Ok(());
@@ -290,6 +312,7 @@ async fn main_loop(
         }
     }
 }
+
 
 fn log_login_summary(am: &authmux::AuthmuxSnapshot, accts: &[authmux::ClaudeAccountDir]) {
     let active = am.current.as_deref().unwrap_or("<none>");

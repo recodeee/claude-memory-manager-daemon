@@ -172,15 +172,51 @@ Safety baked into the compiled binary (cannot be overridden by env or flags):
 - PID 1 and kernel threads are skipped.
 - Hard ceiling of 20 kills per invocation, regardless of `--max`.
 
-Live queries against the running daemon:
+Live queries + control via `mmctl`:
 
 ```
-./target/release/mmctl status      # full JSON snapshot
-./target/release/mmctl accounts    # authmux block only
-./target/release/mmctl memory      # MEMORY_ROOT stat only
-./target/release/mmctl last-tick   # last tick record
-./target/release/mmctl ping        # liveness
+# read-only
+mmctl status                       # full JSON snapshot
+mmctl accounts                     # authmux block only
+mmctl memory                       # MEMORY_ROOT stat only
+mmctl last-tick                    # last tick record
+mmctl ping                         # liveness
+mmctl logs -n 50                   # tail the daemon log
+mmctl logs --follow                # tail -f
+
+# act on the daemon
+mmctl tick                         # poke an immediate tick (bypasses sleep)
+mmctl dry-run on | off             # toggle runtime dry-run; effective next tick
+
+# authmux integration
+mmctl accounts --switch foo@bar    # `authmux switch foo@bar`
+
+# janitor proxy (read-only or dry-run by default)
+mmctl janitor list --min-age-hours=24
+mmctl janitor apply --max=5 --no-dry-run
+
+# skill plugin manager (.claude/skills/ + .claude/skills-disabled/)
+mmctl plugins list
+mmctl plugins install /path/to/local-skill
+mmctl plugins install https://github.com/foo/bar
+mmctl plugins disable my-skill
+mmctl plugins enable  my-skill
+mmctl plugins remove  my-skill
 ```
+
+## Run under systemd (survives reboots)
+
+```
+cargo build --release
+./scripts/install-systemd.sh
+```
+
+The installer copies the unit into `~/.config/systemd/user/`, runs
+`systemctl --user daemon-reload`, then enables and starts the service.
+The unit ships with `DRY_RUN=true` and absolute paths to `claude` /
+`authmux` from your `~/.nvm/.../bin/`.
+
+Follow logs: `journalctl --user -u claude-memory-manager -f`
 
 ## Safety defaults
 

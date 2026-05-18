@@ -20,7 +20,7 @@ pub struct TickOutcome {
     pub exit_code: Option<i32>,
 }
 
-pub async fn run(cfg: &Config, mem: &MemoryStat) -> Result<TickOutcome> {
+pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOutcome> {
     // Coordination guards — never race a live session.
     let live = crate::process::find_claude_sessions();
     // The daemon itself may spawn a `claude` subprocess, which is fine — but
@@ -45,8 +45,8 @@ pub async fn run(cfg: &Config, mem: &MemoryStat) -> Result<TickOutcome> {
         });
     }
 
-    let prompt = build_prompt(cfg);
-    info!(dry_run = cfg.dry_run, model = %cfg.model, "spawning claude CLI for tick");
+    let prompt = build_prompt(cfg, dry_run);
+    info!(dry_run, model = %cfg.model, "spawning claude CLI for tick");
 
     let mut cmd = Command::new(&cfg.claude_bin);
     cmd.arg("-p")
@@ -63,7 +63,7 @@ pub async fn run(cfg: &Config, mem: &MemoryStat) -> Result<TickOutcome> {
         .stdin(Stdio::null());
 
     // Tools — when DRY_RUN, deny mutators.
-    let allow = if cfg.dry_run {
+    let allow = if dry_run {
         "Read,Glob,Grep,Bash(find:*),Bash(ps:*)"
     } else {
         "Read,Write,Edit,Glob,Grep,Bash(find:*),Bash(ps:*)"
@@ -91,7 +91,7 @@ pub async fn run(cfg: &Config, mem: &MemoryStat) -> Result<TickOutcome> {
     Ok(TickOutcome { ran: true, reason_skipped: None, exit_code: status.code() })
 }
 
-fn build_prompt(cfg: &Config) -> String {
+fn build_prompt(cfg: &Config, dry_run: bool) -> String {
     format!(
 "You are the memory-manager daemon tick agent.
 
@@ -112,7 +112,7 @@ Hard rules:
 - Never delete files; empty their body and prefix description with '[pruned]'.
 - If anything looks like a secret, stop and report. Do not log the value.",
         memory_root = cfg.memory_root.display(),
-        dry_run = cfg.dry_run,
+        dry_run = dry_run,
     )
 }
 
