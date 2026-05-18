@@ -734,6 +734,48 @@ async fn main_loop(
     loop {
         let tick_started = now_unix();
 
+        // --- Growth control ---
+        // 1. Rotate history.jsonl if oversize. The file accumulates one row
+        //    per tick per root forever otherwise.
+        // 2. Sweep per-tick agent transcripts (/tmp/cmmd-tick-*.log) older
+        //    than the configured TTL — these are the real disk eater.
+        // Both run once per iteration before any per-root work so a slow
+        // tick can't postpone cleanup.
+        match history::rotate_if_oversize(&cfg.history_file, cfg.history_max_lines) {
+            Ok(true) => {
+                info!(file = %cfg.history_file.display(), "history rotated");
+                metrics_handle.record_history_rotation();
+            }
+            Ok(false) => {}
+            Err(e) => warn!("history rotate failed: {e}"),
+        }
+        let swept = history::sweep_tick_logs(cfg.tick_log_ttl_days);
+        if swept > 0 {
+            info!(count = swept, "swept stale tick transcripts");
+            metrics_handle.record_tick_logs_swept(swept as u64);
+        }
+
+        // --- Daily-tick budget ---
+        // Roll the per-day counter if UTC date has changed; persist so the
+        // ceiling survives a restart within the same day.
+        let today = state::utc_date_string(tick_started);
+        let mut persisted = state::load(&cfg.state_file);
+        state::bump_day_if_needed(&mut persisted, &today);
+        metrics_handle.set_day_ticks_ran(persisted.day_ticks_ran);
+        let daily_cap_reached = cfg.max_ticks_per_day > 0
+            && persisted.day_ticks_ran >= cfg.max_ticks_per_day;
+        if daily_cap_reached {
+            warn!(
+                ran = persisted.day_ticks_ran,
+                cap = cfg.max_ticks_per_day,
+                date = %today,
+                "MAX_TICKS_PER_DAY reached — agent will not be spawned this iteration"
+            );
+        }
+        if let Err(e) = state::save(&cfg.state_file, &persisted) {
+            warn!("persist state failed: {e}");
+        }
+
         // Always refresh authmux + account dirs first (memory stat updates
         // per-root below). This is what makes "who is logged in" visible at
         // any time via `mmctl status`.
@@ -783,19 +825,92 @@ async fn main_loop(
             info!(root = %root.display(), "tending memory root");
             let tick_id = history::new_tick_id();
 
-            let outcome = match tick::run(&cfg, root, dry_run_now, &mem, &tick_id).await {
-                Ok(o) => o,
-                Err(e) => {
-                    error!(root = %root.display(), "tick error: {e:#}");
-                    tick::TickOutcome {
-                        ran: false,
-                        reason_skipped: Some(format!("{e}")),
-                        exit_code: None,
-                        audit_total_issues: 0,
-                        pre_tick_sha: None,
+            let outcome = if daily_cap_reached {
+                // Cheap path: refuse to spawn, but still record the tick so
+                // history/metrics reflect that we hit the cap.
+                metrics_handle.record_daily_cap_block();
+                tick::TickOutcome {
+                    ran: false,
+                    reason_skipped: Some(format!(
+                        "MAX_TICKS_PER_DAY={} reached for {}",
+                        cfg.max_ticks_per_day, today
+                    )),
+                    exit_code: None,
+                    audit_total_issues: 0,
+                    pre_tick_sha: None,
+                }
+            } else {
+                match tick::run(&cfg, root, dry_run_now, &mem, &tick_id).await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        error!(root = %root.display(), "tick error: {e:#}");
+                        tick::TickOutcome {
+                            ran: false,
+                            reason_skipped: Some(format!("{e}")),
+                            exit_code: None,
+                            audit_total_issues: 0,
+                            pre_tick_sha: None,
+                        }
                     }
                 }
             };
+
+            // --- Enforce MAX_FIXES_PER_TICK ---
+            // The "≤3 fixes per tick" rule used to live only in the agent
+            // prompt. If the agent ignored it (or hallucinated more edits),
+            // there was no daemon-side guard. Now: after a non-dry-run tick
+            // that produced changes, count dirty files vs the pre-tick SHA
+            // and roll the whole tick back if it exceeded the cap.
+            if outcome.ran
+                && !dry_run_now
+                && cfg.max_fixes_per_tick > 0
+                && cfg.git_track
+            {
+                if let Some(pre_sha) = outcome.pre_tick_sha.as_ref() {
+                    match history::count_dirty_files(root) {
+                        Ok(n) if (n as u64) > cfg.max_fixes_per_tick => {
+                            warn!(
+                                changed = n,
+                                cap = cfg.max_fixes_per_tick,
+                                "agent exceeded MAX_FIXES_PER_TICK — reverting to pre-tick snapshot"
+                            );
+                            if let Err(e) = history::restore(root, pre_sha) {
+                                error!("revert to pre-tick SHA failed: {e}");
+                            } else {
+                                metrics_handle.record_fix_cap_revert();
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!("could not count dirty files: {e}"),
+                    }
+                }
+            }
+
+            // --- Persisted daily-tick counter ---
+            // Only count *ran* ticks against the daily cap — skipped ticks
+            // (lsof guard, audit-clean) cost nothing. Re-read state to avoid
+            // clobbering any concurrent mmctl mutation.
+            if outcome.ran {
+                let mut p = state::load(&cfg.state_file);
+                state::bump_day_if_needed(&mut p, &today);
+                p.day_ticks_ran = p.day_ticks_ran.saturating_add(1);
+                metrics_handle.set_day_ticks_ran(p.day_ticks_ran);
+                if let Err(e) = state::save(&cfg.state_file, &p) {
+                    warn!("persist day_ticks_ran failed: {e}");
+                }
+            }
+
+            // --- Periodic git gc on this root ---
+            // Without this the memory dir's .git/objects grows forever.
+            // Best-effort — failures are logged, never fatal.
+            match history::git_gc_if_due(root, cfg.git_gc_interval_days) {
+                Ok(true) => {
+                    info!(root = %root.display(), "git gc complete");
+                    metrics_handle.record_git_gc();
+                }
+                Ok(false) => {}
+                Err(e) => warn!(root = %root.display(), "git gc failed: {e}"),
+            }
 
             let now = now_unix();
             if let Some(r) = &outcome.reason_skipped {

@@ -24,6 +24,21 @@ pub struct Config {
     pub webhook_url: String,
     pub model: String,
     pub max_turns: u32,
+    /// Hard cap on number of file modifications the agent is allowed to apply
+    /// per tick. Enforced post-spawn by counting `git status --porcelain`
+    /// entries against the pre-tick snapshot. 0 = unlimited.
+    pub max_fixes_per_tick: u64,
+    /// Daily ceiling on the number of *ran* ticks (skipped ticks don't count).
+    /// The expensive path won't spawn `claude -p` once this is hit. Resets
+    /// at UTC midnight. 0 = unlimited.
+    pub max_ticks_per_day: u64,
+    /// Rotate $HISTORY_FILE when it exceeds this many lines. 0 = disabled.
+    pub history_max_lines: u64,
+    /// TTL in days for `/tmp/cmmd-tick-<id>.log` files. 0 = disabled.
+    pub tick_log_ttl_days: u64,
+    /// Cadence for `git gc --prune=now --aggressive` over each MEMORY_ROOT.
+    /// 0 = disabled.
+    pub git_gc_interval_days: u64,
     pub claude_bin: String,
     pub authmux_bin: String,
     pub claude_accounts_dir: PathBuf,
@@ -76,6 +91,11 @@ impl Config {
             webhook_url: env_str("WEBHOOK_URL", ""),
             model: env_str("MODEL", "claude-haiku-4-5-20251001"),
             max_turns: env_u64("MAX_TURNS", 12) as u32,
+            max_fixes_per_tick: env_u64("MAX_FIXES_PER_TICK", 3),
+            max_ticks_per_day: env_u64("MAX_TICKS_PER_DAY", 100),
+            history_max_lines: env_u64("HISTORY_MAX_LINES", 10_000),
+            tick_log_ttl_days: env_u64("TICK_LOG_TTL_DAYS", 7),
+            git_gc_interval_days: env_u64("GIT_GC_INTERVAL_DAYS", 7),
             claude_bin: env_str("CLAUDE_BIN", "claude"),
             authmux_bin: env_str("AUTHMUX_BIN", "authmux"),
             claude_accounts_dir: env_path(
