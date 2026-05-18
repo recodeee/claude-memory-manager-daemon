@@ -1,0 +1,24 @@
+{
+  "name": "claude-memory-manager-daemon",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Long-running Claude Code agent that tends the file-based memory lane.",
+  "scripts": {
+    "daemon": "bun run src/daemon.ts",
+    "daemon:dry": "DRY_RUN=true bun run src/daemon.ts",
+    "mcp": "bun run mcp/process-server.ts",
+    "tick": "bun run src/daemon.ts --once",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.5.0"
+  }
+}

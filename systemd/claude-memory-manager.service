@@ -1,0 +1,30 @@
+[Unit]
+Description=Claude Memory Manager Daemon
+Documentation=https://github.com/NagyVikt/claude-memory-manager-daemon
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/claude-memory-manager-daemon
+ExecStart=/usr/bin/env bun run src/daemon.ts
+Restart=on-failure
+RestartSec=30
+Environment=DRY_RUN=true
+StandardOutput=append:%t/claude-memory-manager.log
+StandardError=append:%t/claude-memory-manager.log
+# Hardening — daemon only needs read on $HOME for memory + write on /tmp + write on memory dir
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.claude/projects/-home-deadpool/memory /tmp
+PrivateTmp=false
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
+
+# Install as user service:
+#   mkdir -p ~/.config/systemd/user
+#   cp systemd/claude-memory-manager.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now claude-memory-manager
+#   journalctl --user -u claude-memory-manager -f
