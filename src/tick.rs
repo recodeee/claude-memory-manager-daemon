@@ -35,13 +35,18 @@ impl TickOutcome {
     }
 }
 
-pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOutcome> {
+pub async fn run(
+    cfg: &Config,
+    memory_root: &Path,
+    dry_run: bool,
+    mem: &MemoryStat,
+) -> Result<TickOutcome> {
     // Coordination guards — never race a live session.
     //
     // Strategy: ask lsof which (foreign) PIDs currently hold a file under
-    // MEMORY_ROOT open. If lsof is unavailable, fall back to the conservative
+    // memory_root open. If lsof is unavailable, fall back to the conservative
     // process-name guard (any other claude/kiro process aborts the tick).
-    match crate::process::memory_holders(&cfg.memory_root) {
+    match crate::process::memory_holders(memory_root) {
         Ok(holders) if !holders.is_empty() => {
             let names: Vec<String> = holders
                 .iter()
@@ -81,8 +86,8 @@ pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOu
 
     // Cheap deterministic audit — if zero issues, no need to pay for a claude
     // tick. This is the single biggest cost optimization in the daemon.
-    let audit = crate::audit::run_audit(&cfg.memory_root);
-    info!(audit = %audit.summary(), "rust-side audit");
+    let audit = crate::audit::run_audit(memory_root);
+    info!(root = %memory_root.display(), audit = %audit.summary(), "rust-side audit");
     if audit.total_issues() == 0 {
         return Ok(TickOutcome::skipped(
             format!("audit clean — {}", audit.summary()),
@@ -90,14 +95,14 @@ pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOu
         ));
     }
 
-    // Pre-tick git snapshot — only if MEMORY_ROOT is meant to be mutated.
+    // Pre-tick git snapshot — only if memory_root is meant to be mutated.
     let mut pre_tick_sha = None;
     if !dry_run && cfg.git_track {
-        if let Err(e) = crate::history::ensure_git_repo(&cfg.memory_root) {
+        if let Err(e) = crate::history::ensure_git_repo(memory_root) {
             warn!("git_track enabled but ensure_git_repo failed: {e}");
         } else {
             match crate::history::commit_snapshot(
-                &cfg.memory_root,
+                memory_root,
                 &format!("pre-tick snapshot at unix={}", crate::history::now_unix()),
             ) {
                 Ok(Some(sha)) => {
@@ -106,14 +111,14 @@ pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOu
                 }
                 Ok(None) => {
                     // No changes since last commit — use HEAD as the restore target.
-                    pre_tick_sha = crate::history::head_sha(&cfg.memory_root).ok().flatten();
+                    pre_tick_sha = crate::history::head_sha(memory_root).ok().flatten();
                 }
                 Err(e) => warn!("pre-tick snapshot failed: {e}"),
             }
         }
     }
 
-    let prompt = build_prompt(cfg, dry_run, &audit);
+    let prompt = build_prompt(memory_root, dry_run, &audit);
     info!(dry_run, model = %cfg.model, "spawning claude CLI for tick");
 
     let mut cmd = Command::new(&cfg.claude_bin);
@@ -195,7 +200,7 @@ pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOu
     })
 }
 
-fn build_prompt(cfg: &Config, dry_run: bool, audit: &crate::audit::AuditReport) -> String {
+fn build_prompt(memory_root: &Path, dry_run: bool, audit: &crate::audit::AuditReport) -> String {
     // Pre-attach the Rust-side audit report so the agent does not redo the
     // boring inventory work. It can focus on judgment calls (merging dupes,
     // adding Why/How lines, deciding whether to prune).
@@ -224,7 +229,7 @@ Hard rules:
 - Never write outside MEMORY_ROOT.
 - Never delete files; empty their body and prefix description with '[pruned]'.
 - If anything looks like a secret, stop and report. Do not log the value.",
-        memory_root = cfg.memory_root.display(),
+        memory_root = memory_root.display(),
         dry_run = dry_run,
         pre = pre,
     )

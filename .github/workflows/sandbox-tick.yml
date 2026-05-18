@@ -1,0 +1,73 @@
+name: sandbox-tick
+
+# Gated: only runs when the commit message (or PR title) contains
+# "[run-tick]". This workflow burns Claude tokens on every run, so it's
+# explicitly opt-in.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  tick:
+    name: sandbox memory tick (opt-in)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: |
+      contains(github.event.head_commit.message, '[run-tick]') ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.title, '[run-tick]')) ||
+      github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tick-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install claude CLI
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: Verify ANTHROPIC_API_KEY is available
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "ANTHROPIC_API_KEY secret is required for this workflow." >&2
+            exit 1
+          fi
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: cargo build --release
+        run: cargo build --release --bin cmmd
+
+      - name: Run sandbox tick
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          bash scripts/test-tick.sh | tee /tmp/sandbox-tick.log
+
+      - name: Assert tick ran and applied edits
+        run: |
+          # The script's `diff -r FIXTURES SANDBOX` line MUST produce diffs
+          # for at least one of MEMORY.md, duplicate_b.md, or feedback_missing_why.md.
+          # If the agent's behavior changes upstream we'll see it here.
+          set -euo pipefail
+          if ! grep -q '^diff -r' /tmp/sandbox-tick.log; then
+            echo "no diffs produced — agent did not mutate the sandbox" >&2
+            exit 1
+          fi
+          echo "sandbox tick produced expected mutations"

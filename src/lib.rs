@@ -10,6 +10,7 @@ pub mod history;
 pub mod ipc;
 pub mod janitor;
 pub mod memory;
+pub mod metrics;
 pub mod process;
 pub mod state;
 pub mod tick;

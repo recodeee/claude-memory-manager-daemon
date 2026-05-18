@@ -9,7 +9,7 @@
 //! A Unix socket at $STATUS_SOCK lets `mmctl status` query the running daemon.
 
 use claude_memory_manager_daemon::{
-    audit, authmux, config, history, ipc, janitor, memory, process, state, tick,
+    audit, authmux, config, history, ipc, janitor, memory, metrics, process, state, tick,
 };
 
 use anyhow::Result;
@@ -397,6 +397,13 @@ async fn run_daemon(cfg: config::Config, once: bool) -> Result<()> {
     let state = Arc::new(RwLock::new(status));
     let tick_now = Arc::new(tokio::sync::Notify::new());
     let dry_run_runtime = Arc::new(tokio::sync::Mutex::new(initial_dry_run));
+    let metrics_handle = Arc::new(metrics::Metrics::default());
+
+    if !cfg.metrics_bind.is_empty() {
+        let bind = cfg.metrics_bind.clone();
+        let m = metrics_handle.clone();
+        tokio::spawn(async move { metrics::serve(bind, m).await });
+    }
 
     // Status socket.
     {
@@ -423,6 +430,7 @@ async fn run_daemon(cfg: config::Config, once: bool) -> Result<()> {
         state.clone(),
         tick_now.clone(),
         dry_run_runtime.clone(),
+        metrics_handle.clone(),
         once,
         shutdown,
     )
@@ -438,74 +446,96 @@ async fn main_loop(
     state: Arc<RwLock<ipc::DaemonStatus>>,
     tick_now: Arc<tokio::sync::Notify>,
     dry_run_runtime: Arc<tokio::sync::Mutex<bool>>,
+    metrics_handle: Arc<metrics::Metrics>,
     once: bool,
     mut shutdown: tokio::task::JoinHandle<()>,
 ) -> Result<()> {
     loop {
         let tick_started = now_unix();
 
-        // Always refresh authmux + memory + account dirs first.
-        // This is what makes "who is logged in" visible at any time via `mmctl status`.
+        // Always refresh authmux + account dirs first (memory stat updates
+        // per-root below). This is what makes "who is logged in" visible at
+        // any time via `mmctl status`.
         let am = authmux::snapshot(&cfg.authmux_bin).await;
-        let mem = memory::stat(&cfg.memory_root);
         let accts = authmux::claude_account_dirs(&cfg.claude_accounts_dir);
         {
             let mut s = state.write().await;
             s.authmux = serde_json::to_value(&am)?;
-            s.memory = serde_json::to_value(&mem)?;
             s.claude_account_dirs = serde_json::to_value(&accts)?;
         }
         log_login_summary(&am, &accts);
 
         let dry_run_now = *dry_run_runtime.lock().await;
-        // Reflect runtime override into the published status so mmctl sees it.
         state.write().await.dry_run = dry_run_now;
 
-        let outcome = match tick::run(&cfg, dry_run_now, &mem).await {
-            Ok(o) => o,
-            Err(e) => {
-                error!("tick error: {e:#}");
-                tick::TickOutcome {
-                    ran: false,
-                    reason_skipped: Some(format!("{e}")),
-                    exit_code: None,
-                    audit_total_issues: 0,
-                    pre_tick_sha: None,
-                }
+        // Iterate every configured MEMORY_ROOT this tick. Each gets its own
+        // lsof + audit + (optional) spawn. The published `memory` field on
+        // status reflects the PRIMARY root for backward compatibility; per-
+        // root details live in history.jsonl.
+        let mut roots = cfg.all_memory_roots();
+        for (i, root) in roots.iter_mut().enumerate() {
+            let mem = memory::stat(root);
+            if i == 0 {
+                state.write().await.memory = serde_json::to_value(&mem)?;
             }
-        };
+            info!(root = %root.display(), "tending memory root");
 
-        let now = now_unix();
-        let rec = ipc::TickRecord {
-            started_at_unix: tick_started,
-            finished_at_unix: now,
-            ran: outcome.ran,
-            reason_skipped: outcome.reason_skipped.clone(),
-            exit_code: outcome.exit_code,
-        };
-        if let Some(r) = &outcome.reason_skipped {
-            info!(reason = %r, "tick skipped");
-        } else {
-            info!(exit = ?outcome.exit_code, "tick complete");
-        }
-        state.write().await.last_tick = Some(rec);
+            let outcome = match tick::run(&cfg, root, dry_run_now, &mem).await {
+                Ok(o) => o,
+                Err(e) => {
+                    error!(root = %root.display(), "tick error: {e:#}");
+                    tick::TickOutcome {
+                        ran: false,
+                        reason_skipped: Some(format!("{e}")),
+                        exit_code: None,
+                        audit_total_issues: 0,
+                        pre_tick_sha: None,
+                    }
+                }
+            };
 
-        // Append a JSONL row for `mmctl history`. Best-effort: a write failure
-        // doesn't poison the tick loop.
-        let hist_rec = history::TickRecord {
-            tick_id: history::new_tick_id(),
-            started_at_unix: tick_started,
-            finished_at_unix: now,
-            dry_run: dry_run_now,
-            memory_root: cfg.memory_root.display().to_string(),
-            ran: outcome.ran,
-            reason_skipped: outcome.reason_skipped.clone(),
-            exit_code: outcome.exit_code,
-            audit_total_issues: outcome.audit_total_issues,
-            pre_tick_sha: outcome.pre_tick_sha.clone(),
-        };
-        if let Err(e) = history::append(&cfg.history_file, &hist_rec) {
-            warn!("history append failed: {e}");
+            let now = now_unix();
+            if let Some(r) = &outcome.reason_skipped {
+                info!(root = %root.display(), reason = %r, "tick skipped");
+            } else {
+                info!(root = %root.display(), exit = ?outcome.exit_code, "tick complete");
+            }
+
+            // Only the primary root drives state.last_tick (kept for mmctl
+            // last-tick / status JSON compatibility).
+            if i == 0 {
+                let rec = ipc::TickRecord {
+                    started_at_unix: tick_started,
+                    finished_at_unix: now,
+                    ran: outcome.ran,
+                    reason_skipped: outcome.reason_skipped.clone(),
+                    exit_code: outcome.exit_code,
+                };
+                state.write().await.last_tick = Some(rec);
+            }
+
+            let hist_rec = history::TickRecord {
+                tick_id: history::new_tick_id(),
+                started_at_unix: tick_started,
+                finished_at_unix: now,
+                dry_run: dry_run_now,
+                memory_root: root.display().to_string(),
+                ran: outcome.ran,
+                reason_skipped: outcome.reason_skipped.clone(),
+                exit_code: outcome.exit_code,
+                audit_total_issues: outcome.audit_total_issues,
+                pre_tick_sha: outcome.pre_tick_sha.clone(),
+            };
+            match history::append(&cfg.history_file, &hist_rec) {
+                Ok(()) => metrics_handle.record_history_append(),
+                Err(e) => warn!("history append failed: {e}"),
+            }
+            metrics_handle.record_tick(
+                outcome.ran,
+                now.saturating_sub(tick_started),
+                outcome.audit_total_issues as u64,
+                outcome.exit_code,
+            );
         }
 
         if once {
