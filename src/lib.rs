@@ -6,6 +6,7 @@
 pub mod audit;
 pub mod authmux;
 pub mod config;
+pub mod history;
 pub mod ipc;
 pub mod janitor;
 pub mod memory;

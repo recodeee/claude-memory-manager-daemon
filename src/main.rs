@@ -9,7 +9,7 @@
 //! A Unix socket at $STATUS_SOCK lets `mmctl status` query the running daemon.
 
 use claude_memory_manager_daemon::{
-    audit, authmux, config, ipc, janitor, memory, process, state, tick,
+    audit, authmux, config, history, ipc, janitor, memory, process, state, tick,
 };
 
 use anyhow::Result;
@@ -50,6 +50,23 @@ enum Cmd {
     Janitor {
         #[command(subcommand)]
         action: JanitorAction,
+    },
+    /// Show tick history (tail of $HISTORY_FILE, newest first).
+    History {
+        #[arg(short = 'n', long, default_value_t = 20)]
+        lines: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// `git -C MEMORY_ROOT log` — recent git snapshots of memory.
+    GitLog {
+        #[arg(short = 'n', long, default_value_t = 20)]
+        lines: usize,
+    },
+    /// Reset MEMORY_ROOT to a prior git snapshot. Destructive.
+    Restore {
+        /// SHA from `cmmd git-log`. Must be a real commit on the MEMORY_ROOT git.
+        sha: String,
     },
 }
 
@@ -101,7 +118,73 @@ async fn main() -> Result<()> {
         Cmd::Run { once } => run_daemon(cfg, once).await,
         Cmd::Audit { memory_root, json } => run_audit_cmd(cfg, memory_root, json),
         Cmd::Janitor { action } => run_janitor(action),
+        Cmd::History { lines, json } => run_history(cfg, lines, json),
+        Cmd::GitLog { lines } => run_git_log(cfg, lines),
+        Cmd::Restore { sha } => run_restore(cfg, sha),
     }
+}
+
+fn run_history(cfg: config::Config, n: usize, json: bool) -> Result<()> {
+    let recs = history::tail(&cfg.history_file, n);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&recs)?);
+        return Ok(());
+    }
+    if recs.is_empty() {
+        println!("(no history at {})", cfg.history_file.display());
+        return Ok(());
+    }
+    for r in &recs {
+        let when = chrono::DateTime::<chrono::Utc>::from_timestamp(r.started_at_unix as i64, 0)
+            .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| r.started_at_unix.to_string());
+        let dur = r.finished_at_unix.saturating_sub(r.started_at_unix);
+        let status = if r.ran {
+            format!("ran exit={:?} issues={}", r.exit_code, r.audit_total_issues)
+        } else {
+            format!(
+                "skipped: {}",
+                r.reason_skipped.as_deref().unwrap_or("(no reason)")
+            )
+        };
+        let sha = r.pre_tick_sha.as_deref().unwrap_or("-");
+        println!(
+            "{when}  +{dur:>3}s  dry={}  sha={:.10}  {status}",
+            r.dry_run, sha
+        );
+    }
+    Ok(())
+}
+
+fn run_git_log(cfg: config::Config, n: usize) -> Result<()> {
+    let entries = history::log_entries(&cfg.memory_root, n)?;
+    if entries.is_empty() {
+        println!(
+            "(no git history at {}; either git_track is off or MEMORY_ROOT isn't a git repo yet)",
+            cfg.memory_root.display()
+        );
+        return Ok(());
+    }
+    for e in &entries {
+        println!("{:.10}  {}  {}", e.sha, e.date_iso, e.subject);
+    }
+    Ok(())
+}
+
+fn run_restore(cfg: config::Config, sha: String) -> Result<()> {
+    if !cfg.memory_root.join(".git").exists() {
+        return Err(anyhow::anyhow!(
+            "{} is not a git repo — nothing to restore",
+            cfg.memory_root.display()
+        ));
+    }
+    history::restore(&cfg.memory_root, &sha)?;
+    println!(
+        "restored {} to {}",
+        cfg.memory_root.display(),
+        &sha[..sha.len().min(10)]
+    );
+    Ok(())
 }
 
 fn run_audit_cmd(
@@ -386,13 +469,16 @@ async fn main_loop(
                     ran: false,
                     reason_skipped: Some(format!("{e}")),
                     exit_code: None,
+                    audit_total_issues: 0,
+                    pre_tick_sha: None,
                 }
             }
         };
 
+        let now = now_unix();
         let rec = ipc::TickRecord {
             started_at_unix: tick_started,
-            finished_at_unix: now_unix(),
+            finished_at_unix: now,
             ran: outcome.ran,
             reason_skipped: outcome.reason_skipped.clone(),
             exit_code: outcome.exit_code,
@@ -403,6 +489,24 @@ async fn main_loop(
             info!(exit = ?outcome.exit_code, "tick complete");
         }
         state.write().await.last_tick = Some(rec);
+
+        // Append a JSONL row for `mmctl history`. Best-effort: a write failure
+        // doesn't poison the tick loop.
+        let hist_rec = history::TickRecord {
+            tick_id: history::new_tick_id(),
+            started_at_unix: tick_started,
+            finished_at_unix: now,
+            dry_run: dry_run_now,
+            memory_root: cfg.memory_root.display().to_string(),
+            ran: outcome.ran,
+            reason_skipped: outcome.reason_skipped.clone(),
+            exit_code: outcome.exit_code,
+            audit_total_issues: outcome.audit_total_issues,
+            pre_tick_sha: outcome.pre_tick_sha.clone(),
+        };
+        if let Err(e) = history::append(&cfg.history_file, &hist_rec) {
+            warn!("history append failed: {e}");
+        }
 
         if once {
             return Ok(());

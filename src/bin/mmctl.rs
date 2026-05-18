@@ -76,6 +76,20 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Tail the tick history (JSONL append-only log).
+    History {
+        #[arg(short = 'n', long, default_value_t = 20)]
+        lines: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// git -C MEMORY_ROOT log — recent pre-tick snapshots.
+    GitLog {
+        #[arg(short = 'n', long, default_value_t = 20)]
+        lines: usize,
+    },
+    /// Reset MEMORY_ROOT to a prior snapshot (destructive).
+    Restore { sha: String },
     /// Process janitor: list / clean stale claude/codex/kiro sessions.
     Janitor {
         #[command(subcommand)]
@@ -146,9 +160,36 @@ async fn main() -> Result<()> {
         Cmd::DryRun { state } => cmd_dry_run(&cli.sock, &state).await,
         Cmd::Logs { lines, follow } => cmd_logs(&cli.log_file, lines, follow),
         Cmd::Audit { memory_root, json } => cmd_audit(memory_root, json),
+        Cmd::History { lines, json } => cmd_proxy_history(lines, json),
+        Cmd::GitLog { lines } => cmd_proxy_git_log(lines),
+        Cmd::Restore { sha } => cmd_proxy_restore(sha),
         Cmd::Janitor { action } => cmd_janitor(action),
         Cmd::Plugins { action } => cmd_plugins(action),
     }
+}
+
+fn cmd_proxy_history(n: usize, json: bool) -> Result<()> {
+    let cmmd = locate_cmmd()?;
+    let mut c = Command::new(&cmmd);
+    c.arg("history").arg("-n").arg(n.to_string());
+    if json {
+        c.arg("--json");
+    }
+    run_inherit(c)
+}
+
+fn cmd_proxy_git_log(n: usize) -> Result<()> {
+    let cmmd = locate_cmmd()?;
+    let mut c = Command::new(&cmmd);
+    c.arg("git-log").arg("-n").arg(n.to_string());
+    run_inherit(c)
+}
+
+fn cmd_proxy_restore(sha: String) -> Result<()> {
+    let cmmd = locate_cmmd()?;
+    let mut c = Command::new(&cmmd);
+    c.arg("restore").arg(sha);
+    run_inherit(c)
 }
 
 fn cmd_audit(memory_root: Option<PathBuf>, json: bool) -> Result<()> {

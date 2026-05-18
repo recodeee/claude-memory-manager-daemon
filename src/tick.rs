@@ -19,6 +19,20 @@ pub struct TickOutcome {
     pub ran: bool,
     pub reason_skipped: Option<String>,
     pub exit_code: Option<i32>,
+    pub audit_total_issues: usize,
+    pub pre_tick_sha: Option<String>,
+}
+
+impl TickOutcome {
+    fn skipped(reason: String, audit_issues: usize) -> Self {
+        Self {
+            ran: false,
+            reason_skipped: Some(reason),
+            exit_code: None,
+            audit_total_issues: audit_issues,
+            pre_tick_sha: None,
+        }
+    }
 }
 
 pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOutcome> {
@@ -33,39 +47,36 @@ pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOu
                 .iter()
                 .map(|h| format!("{}({})", h.name, h.pid))
                 .collect();
-            return Ok(TickOutcome {
-                ran: false,
-                reason_skipped: Some(format!("memory files open by: {}", names.join(", "))),
-                exit_code: None,
-            });
+            return Ok(TickOutcome::skipped(
+                format!("memory files open by: {}", names.join(", ")),
+                0,
+            ));
         }
         Ok(_) => { /* nobody holds memory open — proceed */ }
         Err(e) => {
             warn!("lsof unavailable ({e}); falling back to process-name guard");
             let live = crate::process::find_claude_sessions();
             if !live.is_empty() {
-                return Ok(TickOutcome {
-                    ran: false,
-                    reason_skipped: Some(format!(
+                return Ok(TickOutcome::skipped(
+                    format!(
                         "{} live claude session(s) detected (lsof fallback)",
                         live.len()
-                    )),
-                    exit_code: None,
-                });
+                    ),
+                    0,
+                ));
             }
         }
     }
 
     if mem.idle_sec < cfg.min_idle.as_secs() {
-        return Ok(TickOutcome {
-            ran: false,
-            reason_skipped: Some(format!(
+        return Ok(TickOutcome::skipped(
+            format!(
                 "memory dir mutated {}s ago (< MIN_IDLE_SEC={})",
                 mem.idle_sec,
                 cfg.min_idle.as_secs()
-            )),
-            exit_code: None,
-        });
+            ),
+            0,
+        ));
     }
 
     // Cheap deterministic audit — if zero issues, no need to pay for a claude
@@ -73,11 +84,33 @@ pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOu
     let audit = crate::audit::run_audit(&cfg.memory_root);
     info!(audit = %audit.summary(), "rust-side audit");
     if audit.total_issues() == 0 {
-        return Ok(TickOutcome {
-            ran: false,
-            reason_skipped: Some(format!("audit clean — {}", audit.summary())),
-            exit_code: None,
-        });
+        return Ok(TickOutcome::skipped(
+            format!("audit clean — {}", audit.summary()),
+            0,
+        ));
+    }
+
+    // Pre-tick git snapshot — only if MEMORY_ROOT is meant to be mutated.
+    let mut pre_tick_sha = None;
+    if !dry_run && cfg.git_track {
+        if let Err(e) = crate::history::ensure_git_repo(&cfg.memory_root) {
+            warn!("git_track enabled but ensure_git_repo failed: {e}");
+        } else {
+            match crate::history::commit_snapshot(
+                &cfg.memory_root,
+                &format!("pre-tick snapshot at unix={}", crate::history::now_unix()),
+            ) {
+                Ok(Some(sha)) => {
+                    info!(sha = %sha, "pre-tick snapshot committed");
+                    pre_tick_sha = Some(sha);
+                }
+                Ok(None) => {
+                    // No changes since last commit — use HEAD as the restore target.
+                    pre_tick_sha = crate::history::head_sha(&cfg.memory_root).ok().flatten();
+                }
+                Err(e) => warn!("pre-tick snapshot failed: {e}"),
+            }
+        }
     }
 
     let prompt = build_prompt(cfg, dry_run, &audit);
@@ -157,6 +190,8 @@ pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOu
         ran: true,
         reason_skipped: None,
         exit_code: status.code(),
+        audit_total_issues: audit.total_issues(),
+        pre_tick_sha,
     })
 }
 

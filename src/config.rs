@@ -11,6 +11,9 @@ pub struct Config {
     pub max_tick: Duration,
     pub dry_run: bool,
     pub state_file: PathBuf,
+    pub history_file: PathBuf,
+    /// Whether to keep MEMORY_ROOT under git for tick-undo.
+    pub git_track: bool,
     pub model: String,
     pub max_turns: u32,
     pub claude_bin: String,
@@ -42,6 +45,8 @@ impl Config {
             max_tick: Duration::from_secs(env_u64("MAX_TICK_SECONDS", 600)),
             dry_run: env_bool("DRY_RUN", true),
             state_file: env_path("STATE_FILE", "/tmp/cmmd-state.json".to_string()),
+            history_file: env_path("HISTORY_FILE", "/tmp/cmmd-history.jsonl".to_string()),
+            git_track: env_bool("GIT_TRACK_MEMORY", true),
             model: env_str("MODEL", "claude-haiku-4-5-20251001"),
             max_turns: env_u64("MAX_TURNS", 12) as u32,
             claude_bin: env_str("CLAUDE_BIN", "claude"),
