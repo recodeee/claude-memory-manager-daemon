@@ -1,40 +1,23 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="claude-memory-manager-daemon">
   <title>claude-memory-manager-daemon</title>
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#1F1F1F"/>
-      <stop offset="100%" stop-color="#0E0E0E"/>
-    </linearGradient>
-    <linearGradient id="loop" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#D97757"/>
-      <stop offset="100%" stop-color="#B85E3F"/>
-    </linearGradient>
-  </defs>
 
   <!-- Rounded dark badge -->
-  <rect x="0" y="0" width="256" height="256" rx="48" ry="48" fill="url(#bg)"/>
+  <rect x="0" y="0" width="256" height="256" rx="48" ry="48" fill="#0E0E0E"/>
 
-  <!-- Tick-loop arrow (the "daemon ticking" idea) -->
-  <g transform="translate(128 128)">
-    <!-- Open circular path: 3/4 arc -->
-    <path d="M 0 -80
-             A 80 80 0 1 1 -56.57 56.57"
-          fill="none"
-          stroke="url(#loop)"
-          stroke-width="14"
-          stroke-linecap="round"/>
-    <!-- Arrowhead at the loop's tail -->
-    <polygon points="-68,42 -42,62 -56,68" fill="#D97757"/>
+  <!-- Claude-style sparkle: 8 lens-shaped petals radiating from center.
+       Solid fills (no gradients) for maximum renderer compatibility. -->
+  <g transform="translate(128 128)" fill="#D97757">
+    <path d="M 0,-92 Q 9,-28 0,0 Q -9,-28 0,-92 Z"/>
+    <g transform="rotate(45)">  <path d="M 0,-72 Q 7,-22 0,0 Q -7,-22 0,-72 Z"/></g>
+    <g transform="rotate(90)">  <path d="M 0,-92 Q 9,-28 0,0 Q -9,-28 0,-92 Z"/></g>
+    <g transform="rotate(135)"> <path d="M 0,-72 Q 7,-22 0,0 Q -7,-22 0,-72 Z"/></g>
+    <g transform="rotate(180)"> <path d="M 0,-92 Q 9,-28 0,0 Q -9,-28 0,-92 Z"/></g>
+    <g transform="rotate(225)"> <path d="M 0,-72 Q 7,-22 0,0 Q -7,-22 0,-72 Z"/></g>
+    <g transform="rotate(270)"> <path d="M 0,-92 Q 9,-28 0,0 Q -9,-28 0,-92 Z"/></g>
+    <g transform="rotate(315)"> <path d="M 0,-72 Q 7,-22 0,0 Q -7,-22 0,-72 Z"/></g>
   </g>
 
-  <!-- Memory bars (3 stacked rows = the file-based memory lane) -->
-  <g transform="translate(128 128)" fill="#F4E5DA">
-    <rect x="-36" y="-22" width="72" height="10" rx="3"/>
-    <rect x="-36" y="-6"  width="58" height="10" rx="3"/>
-    <rect x="-36" y="10"  width="68" height="10" rx="3"/>
-  </g>
-
-  <!-- Status pip (top-right, indicates a running daemon) -->
-  <circle cx="200" cy="56" r="10" fill="#7BD389"/>
-  <circle cx="200" cy="56" r="4"  fill="#FFFFFF"/>
+  <!-- Small green status pip (the daemon-is-up indicator) -->
+  <circle cx="208" cy="48" r="12" fill="#7BD389"/>
+  <circle cx="208" cy="48" r="4"  fill="#FFFFFF"/>
 </svg>

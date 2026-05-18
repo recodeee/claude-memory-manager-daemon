@@ -8,10 +8,10 @@
 //!
 //! A Unix socket at $STATUS_SOCK lets `mmctl status` query the running daemon.
 
-use claude_memory_manager_daemon::{authmux, config, ipc, memory, process, tick};
+use claude_memory_manager_daemon::{authmux, config, ipc, janitor, memory, process, tick};
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -34,6 +34,42 @@ enum Cmd {
     },
     /// Print resolved config + a one-shot authmux+memory snapshot, then exit.
     Doctor,
+    /// Process janitor: list / clean up stale Claude / Codex / Kiro sessions.
+    Janitor {
+        #[command(subcommand)]
+        action: JanitorAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum JanitorAction {
+    /// List stale candidates. Read-only; never kills.
+    List(JanitorOpts),
+    /// Apply: send SIGTERM (then SIGKILL after 10s) to up to --max candidates.
+    /// Refuses to act unless --no-dry-run is passed explicitly.
+    Apply {
+        #[command(flatten)]
+        opts: JanitorOpts,
+        /// Actually kill processes. Without this flag, apply is a no-op preview.
+        #[arg(long)]
+        no_dry_run: bool,
+    },
+}
+
+#[derive(Args, Clone)]
+struct JanitorOpts {
+    /// Minimum age in hours before a process is even considered.
+    #[arg(long, default_value_t = 24.0)]
+    min_age_hours: f64,
+    /// Max CPU% over the last sample. Default keeps active sessions safe.
+    #[arg(long, default_value_t = 0.5)]
+    max_cpu_pct: f32,
+    /// Soft cap on kills per invocation (hard ceiling is 20).
+    #[arg(long, default_value_t = 5)]
+    max: usize,
+    /// Emit JSON instead of pretty text.
+    #[arg(long)]
+    json: bool,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -45,7 +81,75 @@ async fn main() -> Result<()> {
     match cli.cmd.unwrap_or(Cmd::Run { once: false }) {
         Cmd::Doctor => run_doctor(cfg).await,
         Cmd::Run { once } => run_daemon(cfg, once).await,
+        Cmd::Janitor { action } => run_janitor(action),
     }
+}
+
+fn run_janitor(action: JanitorAction) -> Result<()> {
+    match action {
+        JanitorAction::List(opts) => {
+            let jopts = janitor::Opts::new(opts.min_age_hours, opts.max_cpu_pct, opts.max, true);
+            let stale = janitor::list_stale(&jopts);
+            if opts.json {
+                println!("{}", serde_json::to_string_pretty(&stale)?);
+            } else {
+                pretty_print_stale(&stale, &jopts);
+            }
+        }
+        JanitorAction::Apply { opts, no_dry_run } => {
+            let jopts = janitor::Opts::new(opts.min_age_hours, opts.max_cpu_pct, opts.max, !no_dry_run);
+            let outcome = janitor::apply(&jopts)?;
+            if opts.json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                pretty_print_apply(&outcome);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pretty_print_stale(stale: &[janitor::StaleProc], opts: &janitor::Opts) {
+    println!(
+        "janitor list — min-age={}s max-cpu={}% (allowlist: {:?})",
+        opts.min_age_sec, opts.max_cpu_pct, janitor::ALLOWLIST
+    );
+    println!("{:>8} {:>8} {:<18} {:>10} {:>8} {:>10}", "pid", "ppid", "name", "age", "cpu%", "rss_kb");
+    for p in stale {
+        let h = p.age_sec / 3600;
+        let m = (p.age_sec % 3600) / 60;
+        println!(
+            "{:>8} {:>8} {:<18} {:>7}h{:02}m {:>7.1} {:>10}",
+            p.pid,
+            p.ppid.map(|x| x.to_string()).unwrap_or_else(|| "-".into()),
+            truncate(&p.name, 18),
+            h, m, p.cpu_pct, p.rss_kb
+        );
+    }
+    if stale.is_empty() {
+        println!("  (no stale processes match the rules)");
+    }
+}
+
+fn pretty_print_apply(out: &janitor::ApplyOutcome) {
+    println!(
+        "janitor apply — considered={} attempted={} dry_run={}",
+        out.considered, out.attempted.len(), out.dry_run
+    );
+    for r in &out.attempted {
+        if out.dry_run {
+            println!("  would kill pid={} name={} age_sec={}", r.pid, r.name, r.age_sec);
+        } else {
+            println!(
+                "  pid={} name={} sigterm_ok={} survived_grace={} sigkill={:?}",
+                r.pid, r.name, r.sigterm_ok, r.still_alive_after_grace, r.sigkill_ok
+            );
+        }
+    }
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.len() <= n { s.to_string() } else { format!("{}…", &s[..n - 1]) }
 }
 
 fn init_logging() {

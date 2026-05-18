@@ -111,7 +111,8 @@ The daemon also emits a one-line login summary into the log every tick:
 | `src/ipc.rs`         | PID lock + Unix-socket status server / client |
 | `src/bin/mmctl.rs`   | companion CLI |
 | `.claude/agents/memory-manager.md` | per-tick subagent prompt |
-| `.claude/skills/{memory-audit,memory-prune,memory-organize}` | three skills |
+| `src/janitor.rs`     | stale-process janitor: allowlisted-name scan + SIGTERM/SIGKILL with hard ceilings |
+| `.claude/skills/{memory-audit,memory-prune,memory-organize,process-janitor}` | four skills |
 | `scripts/{start,stop,status}.sh` | local lifecycle |
 | `systemd/claude-memory-manager.service` | optional user-level systemd unit |
 
@@ -150,6 +151,26 @@ Resolved config + one-shot snapshot, no daemon:
 ```
 ./target/release/cmmd doctor
 ```
+
+Janitor — find or terminate stale Claude / Codex / Kiro CLI sessions
+(allowlist: `claude`, `claude-cli`, `kiro-cli`, `kiro-cli-chat`, `codex`,
+`codex-cli`). Safe by default — `apply` is a preview unless `--no-dry-run`
+is passed:
+
+```
+./target/release/cmmd janitor list                          # default: age ≥ 24h, cpu ≤ 0.5%
+./target/release/cmmd janitor list --min-age-hours=1 --json
+./target/release/cmmd janitor apply --max=5                 # preview (dry run)
+./target/release/cmmd janitor apply --no-dry-run --max=5    # actually SIGTERM, then SIGKILL after 10s
+```
+
+Safety baked into the compiled binary (cannot be overridden by env or flags):
+
+- Name allowlist as above.
+- Process owner must equal the daemon's uid.
+- Daemon's own pid + the daemon's direct children are skipped.
+- PID 1 and kernel threads are skipped.
+- Hard ceiling of 20 kills per invocation, regardless of `--max`.
 
 Live queries against the running daemon:
 
