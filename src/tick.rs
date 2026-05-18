@@ -68,7 +68,19 @@ pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOu
         });
     }
 
-    let prompt = build_prompt(cfg, dry_run);
+    // Cheap deterministic audit — if zero issues, no need to pay for a claude
+    // tick. This is the single biggest cost optimization in the daemon.
+    let audit = crate::audit::run_audit(&cfg.memory_root);
+    info!(audit = %audit.summary(), "rust-side audit");
+    if audit.total_issues() == 0 {
+        return Ok(TickOutcome {
+            ran: false,
+            reason_skipped: Some(format!("audit clean — {}", audit.summary())),
+            exit_code: None,
+        });
+    }
+
+    let prompt = build_prompt(cfg, dry_run, &audit);
     info!(dry_run, model = %cfg.model, "spawning claude CLI for tick");
 
     let mut cmd = Command::new(&cfg.claude_bin);
@@ -148,21 +160,30 @@ pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOu
     })
 }
 
-fn build_prompt(cfg: &Config, dry_run: bool) -> String {
+fn build_prompt(cfg: &Config, dry_run: bool, audit: &crate::audit::AuditReport) -> String {
+    // Pre-attach the Rust-side audit report so the agent does not redo the
+    // boring inventory work. It can focus on judgment calls (merging dupes,
+    // adding Why/How lines, deciding whether to prune).
+    let pre = serde_json::to_string_pretty(audit).unwrap_or_else(|_| "{}".to_string());
     format!(
         "You are the memory-manager daemon tick agent.
 
 MEMORY_ROOT: {memory_root}
 DRY_RUN: {dry_run}
 
+A deterministic Rust-side audit already ran. Findings (JSON):
+
+{pre}
+
 Procedure:
-1. Inventory MEMORY_ROOT (one Glob + Read pass — no recursion outside).
-2. Audit MEMORY.md: line count, dangling entries, missing entries.
-3. Audit each *.md: frontmatter validity, [[wikilink]] integrity, duplicates,
-   missing **Why:** / **How to apply:** lines on feedback/project entries.
-4. If DRY_RUN=true, REPORT proposed changes only. Do not Edit or Write.
-   If DRY_RUN=false, apply at most THREE targeted Edits this tick.
-5. End with exactly: 'files=N issues=N applied=N deferred=N — <one-line narrative>'.
+1. Trust the audit report above — do NOT re-scan the whole directory.
+2. For each issue, decide whether the FIX is mechanical (broken frontmatter,
+   missing index entry, dangling line) or requires judgment (which duplicate
+   to keep, what Why/How text to write, prune vs preserve).
+3. If DRY_RUN=true, REPORT proposed changes only. Do not Edit or Write.
+   If DRY_RUN=false, apply at most THREE targeted Edits this tick. Defer
+   the rest to the next tick.
+4. End with exactly: 'files=N issues=N applied=N deferred=N — <one-line narrative>'.
 
 Hard rules:
 - Never write outside MEMORY_ROOT.
@@ -170,6 +191,7 @@ Hard rules:
 - If anything looks like a secret, stop and report. Do not log the value.",
         memory_root = cfg.memory_root.display(),
         dry_run = dry_run,
+        pre = pre,
     )
 }
 

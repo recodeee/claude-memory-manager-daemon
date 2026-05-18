@@ -8,7 +8,9 @@
 //!
 //! A Unix socket at $STATUS_SOCK lets `mmctl status` query the running daemon.
 
-use claude_memory_manager_daemon::{authmux, config, ipc, janitor, memory, process, state, tick};
+use claude_memory_manager_daemon::{
+    audit, authmux, config, ipc, janitor, memory, process, state, tick,
+};
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
@@ -34,6 +36,16 @@ enum Cmd {
     },
     /// Print resolved config + a one-shot authmux+memory snapshot, then exit.
     Doctor,
+    /// Deterministic Rust-side audit of MEMORY_ROOT. No claude spawn, no
+    /// token cost. Use to see what would trigger the next tick.
+    Audit {
+        /// Override MEMORY_ROOT for this run.
+        #[arg(long)]
+        memory_root: Option<std::path::PathBuf>,
+        /// Emit JSON instead of summary line.
+        #[arg(long)]
+        json: bool,
+    },
     /// Process janitor: list / clean up stale Claude / Codex / Kiro sessions.
     Janitor {
         #[command(subcommand)]
@@ -87,8 +99,54 @@ async fn main() -> Result<()> {
     match cli.cmd.unwrap_or(Cmd::Run { once: false }) {
         Cmd::Doctor => run_doctor(cfg).await,
         Cmd::Run { once } => run_daemon(cfg, once).await,
+        Cmd::Audit { memory_root, json } => run_audit_cmd(cfg, memory_root, json),
         Cmd::Janitor { action } => run_janitor(action),
     }
+}
+
+fn run_audit_cmd(
+    cfg: config::Config,
+    memory_root: Option<std::path::PathBuf>,
+    json: bool,
+) -> Result<()> {
+    let root = memory_root.unwrap_or(cfg.memory_root);
+    let report = audit::run_audit(&root);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", report.summary());
+        if report.total_issues() == 0 {
+            return Ok(());
+        }
+        if report.memory_md_oversize {
+            println!(
+                "  ⚠ MEMORY.md is {} lines (>200 budget)",
+                report.memory_md_lines
+            );
+        }
+        for f in &report.missing_frontmatter {
+            println!("  ✗ missing frontmatter: {f}");
+        }
+        for t in &report.invalid_type {
+            println!("  ✗ invalid type='{}': {}", t.got, t.file);
+        }
+        for d in &report.dangling_index_entries {
+            println!("  ✗ MEMORY.md points at missing file: {d}");
+        }
+        for u in &report.missing_from_index {
+            println!("  ✗ file not in MEMORY.md: {u}");
+        }
+        for w in &report.broken_wikilinks {
+            println!("  ✗ broken [[{}]] in {}", w.to_slug, w.from);
+        }
+        for m in &report.missing_why_or_how {
+            println!("  ✗ feedback/project missing Why/How: {m}");
+        }
+        for p in &report.duplicate_candidates {
+            println!("  ⚠ likely dupes: {} / {} ({})", p.a, p.b, p.reason);
+        }
+    }
+    Ok(())
 }
 
 fn run_janitor(action: JanitorAction) -> Result<()> {

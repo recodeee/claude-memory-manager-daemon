@@ -3,6 +3,7 @@
 //! Keeping these in a lib lets `mmctl` reuse the same `DaemonStatus` shape and
 //! Unix socket client that `cmmd` exposes, so the two stay in lockstep.
 
+pub mod audit;
 pub mod authmux;
 pub mod config;
 pub mod ipc;

@@ -69,6 +69,13 @@ enum Cmd {
         #[arg(short, long)]
         follow: bool,
     },
+    /// Deterministic Rust-side audit of MEMORY_ROOT (no claude spawn).
+    Audit {
+        #[arg(long)]
+        memory_root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Process janitor: list / clean stale claude/codex/kiro sessions.
     Janitor {
         #[command(subcommand)]
@@ -138,9 +145,23 @@ async fn main() -> Result<()> {
         Cmd::Tick => cmd_tick(&cli.sock).await,
         Cmd::DryRun { state } => cmd_dry_run(&cli.sock, &state).await,
         Cmd::Logs { lines, follow } => cmd_logs(&cli.log_file, lines, follow),
+        Cmd::Audit { memory_root, json } => cmd_audit(memory_root, json),
         Cmd::Janitor { action } => cmd_janitor(action),
         Cmd::Plugins { action } => cmd_plugins(action),
     }
+}
+
+fn cmd_audit(memory_root: Option<PathBuf>, json: bool) -> Result<()> {
+    let cmmd = locate_cmmd()?;
+    let mut c = Command::new(&cmmd);
+    c.arg("audit");
+    if let Some(p) = memory_root {
+        c.arg("--memory-root").arg(p);
+    }
+    if json {
+        c.arg("--json");
+    }
+    run_inherit(c)
 }
 
 // ---------- daemon-socket commands ----------
