@@ -9,7 +9,8 @@
 //! A Unix socket at $STATUS_SOCK lets `mmctl status` query the running daemon.
 
 use claude_memory_manager_daemon::{
-    audit, authmux, config, history, ipc, janitor, memory, metrics, process, state, tick,
+    audit, authmux, config, history, ipc, janitor, memory, metrics, orphan_node, pressure, process,
+    state, tick, tmux_janitor, webhook,
 };
 
 use anyhow::Result;
@@ -70,6 +71,62 @@ enum Cmd {
     },
     /// `git -C MEMORY_ROOT diff <sha>` — preview what `restore <sha>` would change.
     Diff { sha: String },
+    /// Orphaned Node process reaper (mcpvault-stdio-keepalive, mcp-server.cjs, worker-service.cjs).
+    OrphanNode {
+        #[command(subcommand)]
+        action: OrphanNodeAction,
+    },
+    /// Tmux unattached `term-*` session cleanup.
+    TmuxJanitor {
+        #[command(subcommand)]
+        action: TmuxAction,
+    },
+    /// RAM pressure check + escalating response.
+    Pressure {
+        /// Run check + escalation (default = report only).
+        #[arg(long)]
+        respond: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prune old tick transcripts + truncate history.jsonl + rotate main log.
+    Vacuum {
+        /// Drop transcripts older than this many days.
+        #[arg(long, default_value_t = 14)]
+        keep_days: u64,
+        /// Keep at most this many records in history.jsonl.
+        #[arg(long, default_value_t = 10_000)]
+        keep_history: usize,
+        /// Preview only — don't actually delete or truncate.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print just the agent's `files=N issues=N applied=N deferred=N — narrative`
+    /// line from the most recent tick's transcript.
+    LastTickSummary,
+}
+
+#[derive(Subcommand)]
+enum OrphanNodeAction {
+    /// List orphans without killing.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// SIGTERM all detected orphans.
+    Reap {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TmuxAction {
+    /// Cleanup unattached `term-*` sessions.
+    Cleanup {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -124,7 +181,208 @@ async fn main() -> Result<()> {
         Cmd::GitLog { lines } => run_git_log(cfg, lines),
         Cmd::Restore { sha } => run_restore(cfg, sha),
         Cmd::Diff { sha } => run_diff(cfg, sha),
+        Cmd::OrphanNode { action } => run_orphan_node(action),
+        Cmd::TmuxJanitor { action } => run_tmux_janitor(action),
+        Cmd::Pressure { respond, json } => run_pressure(respond, json),
+        Cmd::Vacuum {
+            keep_days,
+            keep_history,
+            dry_run,
+        } => run_vacuum(cfg, keep_days, keep_history, dry_run),
+        Cmd::LastTickSummary => run_last_tick_summary(cfg),
     }
+}
+
+fn run_orphan_node(action: OrphanNodeAction) -> Result<()> {
+    match action {
+        OrphanNodeAction::List { json } => {
+            let orphans = orphan_node::find_orphans();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&orphans)?);
+            } else if orphans.is_empty() {
+                println!("(no orphan node processes)");
+            } else {
+                println!("found {} orphan node process(es):", orphans.len());
+                for o in &orphans {
+                    println!(
+                        "  pid={} ppid={} rss_kb={} cmd={}",
+                        o.pid,
+                        o.ppid,
+                        o.rss_kb,
+                        o.cmdline.chars().take(80).collect::<String>()
+                    );
+                }
+            }
+            Ok(())
+        }
+        OrphanNodeAction::Reap { json } => {
+            let result = orphan_node::reap_orphans();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("scanned={} reaped={}", result.scanned, result.reaped.len());
+                for o in &result.reaped {
+                    println!(
+                        "  killed pid={} ({})",
+                        o.pid,
+                        o.cmdline.chars().take(60).collect::<String>()
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_tmux_janitor(action: TmuxAction) -> Result<()> {
+    match action {
+        TmuxAction::Cleanup { json } => {
+            let result = tmux_janitor::cleanup_unattached();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("scanned={} killed={}", result.scanned, result.killed.len());
+                for name in &result.killed {
+                    println!("  killed session {name}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_pressure(respond: bool, json: bool) -> Result<()> {
+    let result = if respond {
+        pressure::check_and_respond()
+    } else {
+        pressure::PressureResponse {
+            mem: pressure::read_meminfo(),
+            actions_taken: vec![],
+            threshold_exceeded: false,
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!(
+            "ram: total={} MB available={} MB used={}%{}",
+            result.mem.total_kb / 1024,
+            result.mem.available_kb / 1024,
+            result.mem.used_pct,
+            if result.threshold_exceeded {
+                " (PRESSURE)"
+            } else {
+                ""
+            }
+        );
+        for a in &result.actions_taken {
+            println!("  action: {a}");
+        }
+    }
+    Ok(())
+}
+
+fn run_vacuum(
+    cfg: config::Config,
+    keep_days: u64,
+    keep_history: usize,
+    dry_run: bool,
+) -> Result<()> {
+    use std::time::{Duration, SystemTime};
+    let cutoff = SystemTime::now() - Duration::from_secs(keep_days * 86400);
+
+    let mut transcripts_removed = 0;
+    let mut transcripts_kept = 0;
+    if let Ok(entries) = std::fs::read_dir("/tmp") {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let n = name.to_string_lossy();
+            if !n.starts_with("cmmd-tick-") || !n.ends_with(".log") {
+                continue;
+            }
+            let meta = match e.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if mtime < cutoff {
+                if !dry_run {
+                    let _ = std::fs::remove_file(e.path());
+                }
+                transcripts_removed += 1;
+            } else {
+                transcripts_kept += 1;
+            }
+        }
+    }
+
+    let mut history_before: usize = 0;
+    let mut history_after: usize = 0;
+    if cfg.history_file.is_file() {
+        let body = std::fs::read_to_string(&cfg.history_file).unwrap_or_default();
+        let lines: Vec<&str> = body.lines().collect();
+        history_before = lines.len();
+        if lines.len() > keep_history {
+            history_after = keep_history;
+            if !dry_run {
+                let kept = lines[lines.len() - keep_history..].join("\n");
+                let mut out = kept;
+                out.push('\n');
+                let tmp = cfg.history_file.with_extension("tmp");
+                std::fs::write(&tmp, out)?;
+                std::fs::rename(&tmp, &cfg.history_file)?;
+            }
+        } else {
+            history_after = lines.len();
+        }
+    }
+
+    println!(
+        "{}vacuum: transcripts_removed={} transcripts_kept={} history_before={} history_after={} keep_days={} keep_history={}",
+        if dry_run { "[dry-run] " } else { "" },
+        transcripts_removed, transcripts_kept, history_before, history_after, keep_days, keep_history
+    );
+    Ok(())
+}
+
+fn run_last_tick_summary(cfg: config::Config) -> Result<()> {
+    let recs = history::tail(&cfg.history_file, 1);
+    let rec = match recs.first() {
+        Some(r) => r,
+        None => {
+            println!("(no ticks recorded)");
+            return Ok(());
+        }
+    };
+    let transcript = std::path::PathBuf::from(format!("/tmp/cmmd-tick-{}.log", rec.tick_id));
+    let body = match std::fs::read_to_string(&transcript) {
+        Ok(s) => s,
+        Err(_) => {
+            println!(
+                "(no transcript at {}; tick may have been skipped — reason: {:?})",
+                transcript.display(),
+                rec.reason_skipped
+            );
+            return Ok(());
+        }
+    };
+    // Walk the transcript backwards and find the last line that looks like the
+    // agent's structured summary.
+    let summary = body
+        .lines()
+        .rev()
+        .find(|l| l.contains("files=") && l.contains("issues=") && l.contains("applied="))
+        .unwrap_or("(no `files=... issues=... applied=...` line found in transcript)");
+    println!("tick_id    : {}", rec.tick_id);
+    println!("started_at : {}", rec.started_at_unix);
+    println!(
+        "duration   : {}s",
+        rec.finished_at_unix.saturating_sub(rec.started_at_unix)
+    );
+    println!("ran        : {}  exit={:?}", rec.ran, rec.exit_code);
+    println!("audit_issues: {}", rec.audit_total_issues);
+    println!("summary    : {}", summary.trim());
+    Ok(())
 }
 
 fn run_diff(cfg: config::Config, sha: String) -> Result<()> {
@@ -424,7 +682,8 @@ async fn run_daemon(cfg: config::Config, once: bool) -> Result<()> {
     if !cfg.metrics_bind.is_empty() {
         let bind = cfg.metrics_bind.clone();
         let m = metrics_handle.clone();
-        tokio::spawn(async move { metrics::serve(bind, m).await });
+        let interval_sec = cfg.tick_interval.as_secs();
+        tokio::spawn(async move { metrics::serve(bind, m, interval_sec).await });
     }
 
     // Status socket.
@@ -486,6 +745,27 @@ async fn main_loop(
             s.claude_account_dirs = serde_json::to_value(&accts)?;
         }
         log_login_summary(&am, &accts);
+
+        // --- Housekeeping: run every tick regardless of memory-manager logic ---
+        // 1. Kill orphaned tmux sessions
+        let tmux_result = tmux_janitor::cleanup_unattached();
+        if !tmux_result.killed.is_empty() {
+            info!(killed = ?tmux_result.killed, "tmux janitor");
+        }
+        // 2. Reap orphaned node processes (mcpvault, mcp-server, worker-service)
+        let orphan_result = orphan_node::reap_orphans();
+        if !orphan_result.reaped.is_empty() {
+            info!(count = orphan_result.reaped.len(), "orphan node reaper");
+        }
+        // 3. RAM pressure response
+        let pressure_result = pressure::check_and_respond();
+        if pressure_result.threshold_exceeded {
+            info!(
+                used_pct = pressure_result.mem.used_pct,
+                actions = ?pressure_result.actions_taken,
+                "pressure response"
+            );
+        }
 
         let dry_run_now = *dry_run_runtime.lock().await;
         state.write().await.dry_run = dry_run_now;
@@ -559,6 +839,27 @@ async fn main_loop(
                 outcome.audit_total_issues as u64,
                 outcome.exit_code,
             );
+
+            // Webhook delivery — fire-and-forget. Spawned so the loop never
+            // blocks on a slow upstream.
+            if !cfg.webhook_url.is_empty() {
+                let url = cfg.webhook_url.clone();
+                let payload = webhook::TickWebhookPayload {
+                    tick_id: hist_rec.tick_id.clone(),
+                    started_at_unix: hist_rec.started_at_unix,
+                    finished_at_unix: hist_rec.finished_at_unix,
+                    memory_root: hist_rec.memory_root.clone(),
+                    dry_run: hist_rec.dry_run,
+                    ran: hist_rec.ran,
+                    reason_skipped: hist_rec.reason_skipped.clone(),
+                    exit_code: hist_rec.exit_code,
+                    audit_total_issues: hist_rec.audit_total_issues,
+                    pre_tick_sha: hist_rec.pre_tick_sha.clone(),
+                };
+                tokio::spawn(async move {
+                    webhook::post(&url, &payload).await;
+                });
+            }
         }
 
         if once {

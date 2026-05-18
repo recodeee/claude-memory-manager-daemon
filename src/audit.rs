@@ -297,18 +297,50 @@ fn extract_md_link_target(line: &str) -> Option<String> {
 }
 
 fn extract_wikilinks(body: &str) -> Vec<String> {
+    // Skip wikilinks that appear inside fenced ``` code blocks or inline `code`
+    // spans — they're example syntax, not real refs. This kills the audit
+    // false-positive class observed in protocol_memory_usage.md (`[[name]]`,
+    // `[[links]]` appearing as documentation).
     let mut out = Vec::new();
-    let mut rest = body;
-    while let Some(idx) = rest.find("[[") {
-        let after = &rest[idx + 2..];
-        if let Some(close) = after.find("]]") {
-            let slug = after[..close].trim().to_string();
-            if !slug.is_empty() {
-                out.push(slug);
+    let mut in_fenced = false;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fenced = !in_fenced;
+            continue;
+        }
+        if in_fenced {
+            continue;
+        }
+        // Strip inline backtick spans before scanning.
+        let stripped = strip_inline_code(line);
+        let mut rest = stripped.as_str();
+        while let Some(idx) = rest.find("[[") {
+            let after = &rest[idx + 2..];
+            if let Some(close) = after.find("]]") {
+                let slug = after[..close].trim().to_string();
+                if !slug.is_empty() {
+                    out.push(slug);
+                }
+                rest = &after[close + 2..];
+            } else {
+                break;
             }
-            rest = &after[close + 2..];
-        } else {
-            break;
+        }
+    }
+    out
+}
+
+fn strip_inline_code(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut in_code = false;
+    for ch in line.chars() {
+        if ch == '`' {
+            in_code = !in_code;
+            continue;
+        }
+        if !in_code {
+            out.push(ch);
         }
     }
     out
@@ -428,6 +460,43 @@ mod tests {
         assert!(
             !r.duplicate_candidates.is_empty(),
             "should flag matching descriptions"
+        );
+    }
+
+    #[test]
+    fn wikilinks_inside_fenced_code_are_ignored() {
+        let dir = write_fixture("fenced");
+        write_md(&dir, "MEMORY.md", "- [Doc](doc.md) — protocol notes\n");
+        let body = "---\nname: doc\ndescription: x\nmetadata:\n  type: reference\n---\n\n\
+            Real link: [[real-name]]\n\n\
+            ```\n\
+            Example syntax: [[name]] and [[links]]\n\
+            ```\n\n\
+            Inline `[[also-skipped]]` example.\n";
+        write_md(&dir, "doc.md", body);
+        // Also create a real target so [[real-name]] resolves.
+        write_md(
+            &dir,
+            "real.md",
+            "---\nname: real-name\ndescription: y\nmetadata:\n  type: reference\n---\n\nbody\n",
+        );
+        let r = run_audit(&dir);
+        let broken_slugs: Vec<&str> = r
+            .broken_wikilinks
+            .iter()
+            .map(|w| w.to_slug.as_str())
+            .collect();
+        assert!(
+            !broken_slugs.contains(&"name"),
+            "[[name]] inside ``` must be skipped, got {broken_slugs:?}"
+        );
+        assert!(
+            !broken_slugs.contains(&"links"),
+            "[[links]] inside ``` must be skipped"
+        );
+        assert!(
+            !broken_slugs.contains(&"also-skipped"),
+            "[[also-skipped]] inside inline `code` must be skipped"
         );
     }
 

@@ -53,7 +53,9 @@ impl Metrics {
         self.history_appends_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn render_prometheus(&self) -> String {
+    /// `tick_interval_sec` lets the exporter publish a derived gauge for
+    /// "is the daemon stuck?" — staleness > 2× interval is unhealthy.
+    pub fn render_prometheus(&self, tick_interval_sec: u64) -> String {
         let now = crate::history::now_unix();
         let last_tick = self.last_tick_unix.load(Ordering::Relaxed);
         let staleness = if last_tick == 0 {
@@ -62,6 +64,18 @@ impl Metrics {
             now.saturating_sub(last_tick)
         };
         let mut out = String::new();
+        // Build info — published once. CARGO_PKG_VERSION is always available;
+        // GIT_SHA is set by build.rs (empty when not in a git checkout).
+        let version = env!("CARGO_PKG_VERSION");
+        let git_sha = option_env!("CMMD_GIT_SHA").unwrap_or("unknown");
+        out.push_str("# HELP cmmd_build_info Static build information.\n");
+        out.push_str("# TYPE cmmd_build_info gauge\n");
+        out.push_str(&format!(
+            "cmmd_build_info{{version=\"{version}\",git_sha=\"{git_sha}\"}} 1\n"
+        ));
+        out.push_str("# HELP cmmd_tick_interval_sec Configured TICK_INTERVAL_SEC.\n");
+        out.push_str("# TYPE cmmd_tick_interval_sec gauge\n");
+        out.push_str(&format!("cmmd_tick_interval_sec {}\n", tick_interval_sec));
         out.push_str("# HELP cmmd_ticks_total Total tick attempts (ran + skipped).\n");
         out.push_str("# TYPE cmmd_ticks_total counter\n");
         out.push_str(&format!(
@@ -114,10 +128,11 @@ impl Metrics {
     }
 }
 
-/// Start a minimal HTTP server on `bind`. Only `GET /metrics` is supported;
-/// anything else returns 404. Designed to be unobtrusive — if the bind fails
-/// (port in use), we warn and continue rather than aborting the daemon.
-pub async fn serve(bind: String, metrics: std::sync::Arc<Metrics>) {
+/// Start a minimal HTTP server on `bind`. Supported endpoints:
+///   GET /metrics  — Prometheus exposition
+///   GET /healthz  — 200 if last-tick is within 2× tick_interval, else 503
+/// Anything else returns 404. Bind failure is logged and the task exits.
+pub async fn serve(bind: String, metrics: std::sync::Arc<Metrics>, tick_interval_sec: u64) {
     let listener = match TcpListener::bind(&bind).await {
         Ok(l) => l,
         Err(e) => {
@@ -142,15 +157,36 @@ pub async fn serve(bind: String, metrics: std::sync::Arc<Metrics>) {
             let n = sock.read(&mut buf).await.unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]);
             let first_line = req.lines().next().unwrap_or("");
-            let body = if first_line.starts_with("GET /metrics") {
-                metrics.render_prometheus()
+            let (body, status_line, content_type) = if first_line.starts_with("GET /metrics") {
+                (
+                    metrics.render_prometheus(tick_interval_sec),
+                    "HTTP/1.1 200 OK",
+                    "text/plain; version=0.0.4",
+                )
+            } else if first_line.starts_with("GET /healthz") {
+                let now = crate::history::now_unix();
+                let last = metrics.last_tick_unix.load(Ordering::Relaxed);
+                let staleness = if last == 0 {
+                    0
+                } else {
+                    now.saturating_sub(last)
+                };
+                let limit = tick_interval_sec.saturating_mul(2);
+                if last == 0 || staleness <= limit {
+                    (
+                        format!("ok staleness={staleness}s limit={limit}s\n"),
+                        "HTTP/1.1 200 OK",
+                        "text/plain",
+                    )
+                } else {
+                    (
+                        format!("stuck staleness={staleness}s > limit={limit}s\n"),
+                        "HTTP/1.1 503 Service Unavailable",
+                        "text/plain",
+                    )
+                }
             } else {
-                String::new()
-            };
-            let (status_line, content_type) = if body.is_empty() {
-                ("HTTP/1.1 404 Not Found", "text/plain")
-            } else {
-                ("HTTP/1.1 200 OK", "text/plain; version=0.0.4")
+                (String::new(), "HTTP/1.1 404 Not Found", "text/plain")
             };
             let resp = format!(
                 "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -171,8 +207,10 @@ mod tests {
         let m = Metrics::default();
         m.record_tick(true, 5, 3, Some(0));
         m.record_tick(false, 0, 0, None);
-        let out = m.render_prometheus();
+        let out = m.render_prometheus(900);
         for name in [
+            "cmmd_build_info",
+            "cmmd_tick_interval_sec",
             "cmmd_ticks_total",
             "cmmd_ticks_ran_total",
             "cmmd_ticks_skipped_total",

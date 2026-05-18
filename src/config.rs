@@ -20,6 +20,8 @@ pub struct Config {
     pub git_track: bool,
     /// Where the Prometheus exporter binds. Empty string = disabled.
     pub metrics_bind: String,
+    /// Optional WEBHOOK_URL (http://host[:port][/path]). Empty = disabled.
+    pub webhook_url: String,
     pub model: String,
     pub max_turns: u32,
     pub claude_bin: String,
@@ -71,6 +73,7 @@ impl Config {
             history_file: env_path("HISTORY_FILE", "/tmp/cmmd-history.jsonl".to_string()),
             git_track: env_bool("GIT_TRACK_MEMORY", true),
             metrics_bind: env_str("METRICS_BIND", "127.0.0.1:9601"),
+            webhook_url: env_str("WEBHOOK_URL", ""),
             model: env_str("MODEL", "claude-haiku-4-5-20251001"),
             max_turns: env_u64("MAX_TURNS", 12) as u32,
             claude_bin: env_str("CLAUDE_BIN", "claude"),

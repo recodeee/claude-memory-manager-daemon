@@ -112,6 +112,46 @@ enum Cmd {
         #[command(subcommand)]
         action: PluginsCmd,
     },
+    /// Show just the agent's final `files=N issues=N applied=N ...` line.
+    LastTickSummary,
+    /// Prune old tick transcripts + truncate history.jsonl.
+    Vacuum {
+        #[arg(long, default_value_t = 14)]
+        keep_days: u64,
+        #[arg(long, default_value_t = 10_000)]
+        keep_history: usize,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Orphan Node process reaper (mcpvault-stdio-keepalive, mcp-server.cjs, worker-service.cjs).
+    OrphanNode {
+        #[command(subcommand)]
+        action: OrphanNodeCmd,
+    },
+    /// Tmux unattached term-* session cleanup.
+    TmuxJanitor {
+        #[arg(long)]
+        json: bool,
+    },
+    /// RAM pressure check + optional escalating response.
+    Pressure {
+        #[arg(long)]
+        respond: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum OrphanNodeCmd {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Reap {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args)]
@@ -179,7 +219,81 @@ async fn main() -> Result<()> {
         Cmd::TickLog { tick_id } => cmd_tick_log(tick_id),
         Cmd::Janitor { action } => cmd_janitor(action),
         Cmd::Plugins { action } => cmd_plugins(action),
+        Cmd::LastTickSummary => cmd_proxy_last_summary(),
+        Cmd::Vacuum {
+            keep_days,
+            keep_history,
+            dry_run,
+        } => cmd_proxy_vacuum(keep_days, keep_history, dry_run),
+        Cmd::OrphanNode { action } => cmd_proxy_orphan_node(action),
+        Cmd::TmuxJanitor { json } => cmd_proxy_tmux_janitor(json),
+        Cmd::Pressure { respond, json } => cmd_proxy_pressure(respond, json),
     }
+}
+
+fn cmd_proxy_last_summary() -> Result<()> {
+    let cmmd = locate_cmmd()?;
+    let mut c = Command::new(&cmmd);
+    c.arg("last-tick-summary");
+    run_inherit(c)
+}
+
+fn cmd_proxy_vacuum(keep_days: u64, keep_history: usize, dry_run: bool) -> Result<()> {
+    let cmmd = locate_cmmd()?;
+    let mut c = Command::new(&cmmd);
+    c.arg("vacuum")
+        .arg("--keep-days")
+        .arg(keep_days.to_string())
+        .arg("--keep-history")
+        .arg(keep_history.to_string());
+    if dry_run {
+        c.arg("--dry-run");
+    }
+    run_inherit(c)
+}
+
+fn cmd_proxy_orphan_node(action: OrphanNodeCmd) -> Result<()> {
+    let cmmd = locate_cmmd()?;
+    let mut c = Command::new(&cmmd);
+    c.arg("orphan-node");
+    match action {
+        OrphanNodeCmd::List { json } => {
+            c.arg("list");
+            if json {
+                c.arg("--json");
+            }
+        }
+        OrphanNodeCmd::Reap { json } => {
+            c.arg("reap");
+            if json {
+                c.arg("--json");
+            }
+        }
+    }
+    run_inherit(c)
+}
+
+fn cmd_proxy_tmux_janitor(json: bool) -> Result<()> {
+    let cmmd = locate_cmmd()?;
+    let mut c = Command::new(&cmmd);
+    c.arg("tmux-janitor").arg("cleanup");
+    if json {
+        c.arg("--json");
+    }
+    run_inherit(c)
+}
+
+fn cmd_proxy_pressure(respond: bool, json: bool) -> Result<()> {
+    let cmmd = locate_cmmd()?;
+    let mut c = Command::new(&cmmd);
+    c.arg("pressure");
+    if respond {
+        c.arg("--respond");
+    }
+    if json {
+        c.arg("--json");
+    }
+    run_inherit(c)
 }
 
 fn cmd_proxy_history(n: usize, json: bool) -> Result<()> {
