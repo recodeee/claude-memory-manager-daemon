@@ -41,7 +41,11 @@ pub async fn snapshot(authmux_bin: &str) -> AuthmuxSnapshot {
     }
     snap.available = true;
 
-    snap.current = run_capture(authmux_bin, &["current"]).await.ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    snap.current = run_capture(authmux_bin, &["current"])
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     if let Ok(out) = run_capture(authmux_bin, &["list"]).await {
         snap.accounts = parse_list(&out);
@@ -59,7 +63,7 @@ pub async fn snapshot(authmux_bin: &str) -> AuthmuxSnapshot {
     snap
 }
 
-fn parse_list(out: &str) -> Vec<Account> {
+pub(crate) fn parse_list(out: &str) -> Vec<Account> {
     let mut acc = Vec::new();
     for raw in out.lines() {
         let active = raw.starts_with('*');
@@ -73,7 +77,13 @@ fn parse_list(out: &str) -> Vec<Account> {
             Some(e) if e.contains('@') => e.to_string(),
             _ => continue,
         };
-        let mut entry = Account { email, kind: None, five_h_pct: None, weekly_pct: None, active };
+        let mut entry = Account {
+            email,
+            kind: None,
+            five_h_pct: None,
+            weekly_pct: None,
+            active,
+        };
         // Greedy K=V scan over the rest.
         let rest: Vec<&str> = parts.collect();
         let mut joined = rest.join(" ");
@@ -118,21 +128,31 @@ async fn which(bin: &str) -> Option<String> {
         return None;
     }
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if path.is_empty() { None } else { Some(path) }
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 /// Enumerate parallel Claude Code accounts under $CLAUDE_ACCOUNTS_DIR.
 /// Each subdir with a `.credentials.json` counts as a logged-in account.
 pub fn claude_account_dirs(root: &Path) -> Vec<ClaudeAccountDir> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(root) else { return out };
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return out;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
         let creds = path.join(".credentials.json");
-        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
         out.push(ClaudeAccountDir {
             name,
             has_credentials: creds.exists(),
@@ -148,4 +168,51 @@ pub struct ClaudeAccountDir {
     pub name: String,
     pub has_credentials: bool,
     pub path: std::path::PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_basic_authmux_list_with_active_row() {
+        let out = "\
+  admin@kollarrobert.sk  type=ChatGPT seat (Business)  5h=98%  weekly=100%
+* odin@kollarrobert.sk  type=ChatGPT seat (Business)  5h=99%  weekly=84%
+  zeus@mite.hu          type=ChatGPT seat (Business)  5h=99%  weekly=95%
+";
+        let accts = parse_list(out);
+        assert_eq!(accts.len(), 3);
+        assert_eq!(accts[0].email, "admin@kollarrobert.sk");
+        assert!(!accts[0].active);
+        assert_eq!(accts[1].email, "odin@kollarrobert.sk");
+        assert!(accts[1].active, "the row with '*' must parse as active");
+        assert_eq!(accts[0].five_h_pct, Some(98));
+        assert_eq!(accts[0].weekly_pct, Some(100));
+        assert_eq!(accts[0].kind.as_deref(), Some("ChatGPT seat (Business)"));
+    }
+
+    #[test]
+    fn ignores_blank_and_non_email_rows() {
+        let out = "\n\n   \nauto-switch: OFF\nservice: inactive\n";
+        let accts = parse_list(out);
+        assert!(accts.is_empty(), "no email rows → no accounts");
+    }
+
+    #[test]
+    fn missing_percentages_parse_as_none() {
+        let out = "  pejko@gitguardex.com  type=ChatGPT seat (Business)\n";
+        let accts = parse_list(out);
+        assert_eq!(accts.len(), 1);
+        assert!(accts[0].five_h_pct.is_none());
+        assert!(accts[0].weekly_pct.is_none());
+    }
+
+    #[test]
+    fn handles_email_with_dots_and_subdomains() {
+        let out = "  pejko.smith@team.example.co.uk  type=Free  5h=10%  weekly=5%\n";
+        let accts = parse_list(out);
+        assert_eq!(accts.len(), 1);
+        assert_eq!(accts[0].email, "pejko.smith@team.example.co.uk");
+    }
 }

@@ -1,0 +1,9 @@
+- [User role](user_role.md) — Senior infra engineer, owns the ingestion pipeline.
+- [Don't mock the DB](feedback_db_mocking.md) — integration tests must hit a real database.
+- [Stale: deprecated tool](project_stale_tool.md) — old internal CLI, removed 2025-12-09.
+- [Same fact, copy A](duplicate_a.md) — auth middleware rewrite is compliance-driven.
+- [Same fact, copy B](duplicate_b.md) — auth middleware rewrite is compliance-driven.
+- [Linear board](reference_linear.md) — pipeline bugs are tracked in project INGEST.
+- [Missing on disk](dangling_entry.md) — this file does not exist in the directory.
+- [Bad frontmatter file](broken_frontmatter.md) — missing required fields.
+- [Feedback no Why](feedback_missing_why.md) — pruned/short, missing the structured lines.

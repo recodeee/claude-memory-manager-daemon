@@ -8,7 +8,7 @@
 //!
 //! A Unix socket at $STATUS_SOCK lets `mmctl status` query the running daemon.
 
-use claude_memory_manager_daemon::{authmux, config, ipc, janitor, memory, process, tick};
+use claude_memory_manager_daemon::{authmux, config, ipc, janitor, memory, process, state, tick};
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
@@ -59,7 +59,9 @@ enum JanitorAction {
 #[derive(Args, Clone)]
 struct JanitorOpts {
     /// Minimum age in hours before a process is even considered.
-    #[arg(long, default_value_t = 24.0)]
+    /// Default is conservative-enough for typical idle CLI sessions to fall
+    /// out (6h) without snagging a quietly-running interactive session.
+    #[arg(long, default_value_t = 6.0)]
     min_age_hours: f64,
     /// Max CPU% over the last sample. Default keeps active sessions safe.
     #[arg(long, default_value_t = 0.5)]
@@ -67,6 +69,10 @@ struct JanitorOpts {
     /// Soft cap on kills per invocation (hard ceiling is 20).
     #[arg(long, default_value_t = 5)]
     max: usize,
+    /// Only consider processes with no controlling TTY (orphaned).
+    /// Strongly recommended on. Disable with --no-require-no-tty.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    require_no_tty: bool,
     /// Emit JSON instead of pretty text.
     #[arg(long)]
     json: bool,
@@ -88,7 +94,13 @@ async fn main() -> Result<()> {
 fn run_janitor(action: JanitorAction) -> Result<()> {
     match action {
         JanitorAction::List(opts) => {
-            let jopts = janitor::Opts::new(opts.min_age_hours, opts.max_cpu_pct, opts.max, true);
+            let jopts = janitor::Opts::new(
+                opts.min_age_hours,
+                opts.max_cpu_pct,
+                opts.max,
+                true,
+                opts.require_no_tty,
+            );
             let stale = janitor::list_stale(&jopts);
             if opts.json {
                 println!("{}", serde_json::to_string_pretty(&stale)?);
@@ -97,7 +109,13 @@ fn run_janitor(action: JanitorAction) -> Result<()> {
             }
         }
         JanitorAction::Apply { opts, no_dry_run } => {
-            let jopts = janitor::Opts::new(opts.min_age_hours, opts.max_cpu_pct, opts.max, !no_dry_run);
+            let jopts = janitor::Opts::new(
+                opts.min_age_hours,
+                opts.max_cpu_pct,
+                opts.max,
+                !no_dry_run,
+                opts.require_no_tty,
+            );
             let outcome = janitor::apply(&jopts)?;
             if opts.json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
@@ -112,9 +130,14 @@ fn run_janitor(action: JanitorAction) -> Result<()> {
 fn pretty_print_stale(stale: &[janitor::StaleProc], opts: &janitor::Opts) {
     println!(
         "janitor list — min-age={}s max-cpu={}% (allowlist: {:?})",
-        opts.min_age_sec, opts.max_cpu_pct, janitor::ALLOWLIST
+        opts.min_age_sec,
+        opts.max_cpu_pct,
+        janitor::ALLOWLIST
     );
-    println!("{:>8} {:>8} {:<18} {:>10} {:>8} {:>10}", "pid", "ppid", "name", "age", "cpu%", "rss_kb");
+    println!(
+        "{:>8} {:>8} {:<18} {:>10} {:>8} {:>10}",
+        "pid", "ppid", "name", "age", "cpu%", "rss_kb"
+    );
     for p in stale {
         let h = p.age_sec / 3600;
         let m = (p.age_sec % 3600) / 60;
@@ -123,7 +146,10 @@ fn pretty_print_stale(stale: &[janitor::StaleProc], opts: &janitor::Opts) {
             p.pid,
             p.ppid.map(|x| x.to_string()).unwrap_or_else(|| "-".into()),
             truncate(&p.name, 18),
-            h, m, p.cpu_pct, p.rss_kb
+            h,
+            m,
+            p.cpu_pct,
+            p.rss_kb
         );
     }
     if stale.is_empty() {
@@ -134,11 +160,16 @@ fn pretty_print_stale(stale: &[janitor::StaleProc], opts: &janitor::Opts) {
 fn pretty_print_apply(out: &janitor::ApplyOutcome) {
     println!(
         "janitor apply — considered={} attempted={} dry_run={}",
-        out.considered, out.attempted.len(), out.dry_run
+        out.considered,
+        out.attempted.len(),
+        out.dry_run
     );
     for r in &out.attempted {
         if out.dry_run {
-            println!("  would kill pid={} name={} age_sec={}", r.pid, r.name, r.age_sec);
+            println!(
+                "  would kill pid={} name={} age_sec={}",
+                r.pid, r.name, r.age_sec
+            );
         } else {
             println!(
                 "  pid={} name={} sigterm_ok={} survived_grace={} sigkill={:?}",
@@ -149,7 +180,11 @@ fn pretty_print_apply(out: &janitor::ApplyOutcome) {
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n { s.to_string() } else { format!("{}…", &s[..n - 1]) }
+    if s.len() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..n - 1])
+    }
 }
 
 fn init_logging() {
@@ -196,11 +231,20 @@ async fn run_daemon(cfg: config::Config, once: bool) -> Result<()> {
         );
     }
 
+    // Apply any persisted runtime override (e.g. `mmctl dry-run off` from a
+    // previous run). Logged so the operator can see the override kicked in.
+    let persisted = state::load(&cfg.state_file);
+    let initial_dry_run = persisted.dry_run_override.unwrap_or(cfg.dry_run);
+    if persisted.dry_run_override.is_some() {
+        info!(persisted = ?persisted, configured = cfg.dry_run, effective = initial_dry_run,
+              "applied persisted dry_run override");
+    }
+
     let started_at = now_unix();
     let status = ipc::DaemonStatus {
         pid: std::process::id(),
         started_at_unix: started_at,
-        dry_run: cfg.dry_run,
+        dry_run: initial_dry_run,
         model: cfg.model.clone(),
         memory_root: cfg.memory_root.display().to_string(),
         last_tick: None,
@@ -211,7 +255,7 @@ async fn run_daemon(cfg: config::Config, once: bool) -> Result<()> {
     };
     let state = Arc::new(RwLock::new(status));
     let tick_now = Arc::new(tokio::sync::Notify::new());
-    let dry_run_runtime = Arc::new(tokio::sync::Mutex::new(cfg.dry_run));
+    let dry_run_runtime = Arc::new(tokio::sync::Mutex::new(initial_dry_run));
 
     // Status socket.
     {
@@ -220,6 +264,7 @@ async fn run_daemon(cfg: config::Config, once: bool) -> Result<()> {
             state: state.clone(),
             tick_now: tick_now.clone(),
             dry_run: dry_run_runtime.clone(),
+            state_file: cfg.state_file.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = ipc::serve_status(sock, handles).await {
@@ -239,7 +284,8 @@ async fn run_daemon(cfg: config::Config, once: bool) -> Result<()> {
         dry_run_runtime.clone(),
         once,
         shutdown,
-    ).await;
+    )
+    .await;
 
     ipc::release_lock(&cfg_arc.lock_file, &cfg_arc.pid_file);
     info!("daemon down");
@@ -278,7 +324,11 @@ async fn main_loop(
             Ok(o) => o,
             Err(e) => {
                 error!("tick error: {e:#}");
-                tick::TickOutcome { ran: false, reason_skipped: Some(format!("{e}")), exit_code: None }
+                tick::TickOutcome {
+                    ran: false,
+                    reason_skipped: Some(format!("{e}")),
+                    exit_code: None,
+                }
             }
         };
 
@@ -313,7 +363,6 @@ async fn main_loop(
     }
 }
 
-
 fn log_login_summary(am: &authmux::AuthmuxSnapshot, accts: &[authmux::ClaudeAccountDir]) {
     let active = am.current.as_deref().unwrap_or("<none>");
     let n_authmux = am.accounts.len();
@@ -338,5 +387,8 @@ async fn install_signal_handler() {
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

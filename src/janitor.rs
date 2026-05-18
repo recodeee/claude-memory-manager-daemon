@@ -23,9 +23,36 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid as SysPid, ProcessRefreshKind, RefreshKind, System};
 
 pub const ALLOWLIST: &[&str] = &[
-    "claude", "claude-cli", "kiro-cli", "kiro-cli-chat", "codex", "codex-cli",
+    "claude",
+    "claude-cli",
+    "kiro-cli",
+    "kiro-cli-chat",
+    "codex",
+    "codex-cli",
 ];
 pub const MAX_KILLS_HARD: usize = 20;
+
+/// True if the process has NO controlling terminal — i.e. it's orphaned
+/// from the shell that started it. We read /proc/<pid>/stat field 7
+/// (tty_nr); 0 means no TTY.
+fn proc_has_no_tty(pid: u32) -> bool {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(s) => s,
+        Err(_) => return false, // unknown — be conservative, treat as "has tty"
+    };
+    // Field 2 (comm) may contain spaces inside parentheses, so split off the
+    // last ')' and then parse the rest as whitespace-separated fields.
+    let Some(after) = stat.rsplit_once(')').map(|x| x.1) else {
+        return false;
+    };
+    // After ")" the next token is state (field 3); then field 4 = ppid,
+    // field 5 = pgrp, field 6 = session, field 7 = tty_nr.
+    let toks: Vec<&str> = after.split_whitespace().collect();
+    if toks.len() < 5 {
+        return false;
+    }
+    toks[4].parse::<i64>().map(|n| n == 0).unwrap_or(false)
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StaleProc {
@@ -44,15 +71,24 @@ pub struct Opts {
     pub max_cpu_pct: f32,
     pub max_kills: usize,
     pub dry_run: bool,
+    /// If true, only kill processes with no controlling TTY (orphaned).
+    pub require_no_tty: bool,
 }
 
 impl Opts {
-    pub fn new(min_age_hours: f64, max_cpu_pct: f32, max_kills: usize, dry_run: bool) -> Self {
+    pub fn new(
+        min_age_hours: f64,
+        max_cpu_pct: f32,
+        max_kills: usize,
+        dry_run: bool,
+        require_no_tty: bool,
+    ) -> Self {
         Self {
             min_age_sec: (min_age_hours * 3600.0) as u64,
             max_cpu_pct,
             max_kills: max_kills.min(MAX_KILLS_HARD),
             dry_run,
+            require_no_tty,
         }
     }
 }
@@ -96,6 +132,9 @@ pub fn list_stale(opts: &Opts) -> Vec<StaleProc> {
         }
         let cpu = p.cpu_usage();
         if cpu > opts.max_cpu_pct {
+            continue;
+        }
+        if opts.require_no_tty && !proc_has_no_tty(raw_pid) {
             continue;
         }
 
@@ -179,7 +218,11 @@ pub fn apply(opts: &Opts) -> Result<ApplyOutcome> {
         });
     }
 
-    Ok(ApplyOutcome { considered, attempted: records, dry_run: opts.dry_run })
+    Ok(ApplyOutcome {
+        considered,
+        attempted: records,
+        dry_run: opts.dry_run,
+    })
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -188,13 +231,14 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 fn fresh_system() -> System {
-    System::new_with_specifics(
-        RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
-    )
+    System::new_with_specifics(RefreshKind::new().with_processes(ProcessRefreshKind::everything()))
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn current_uid() -> u32 {
@@ -202,9 +246,60 @@ fn current_uid() -> u32 {
     unsafe { libc_getuid() }
 }
 
-extern "C" { fn getuid() -> u32; }
-unsafe fn libc_getuid() -> u32 { getuid() }
+extern "C" {
+    fn getuid() -> u32;
+}
+unsafe fn libc_getuid() -> u32 {
+    getuid()
+}
 
 // keep linter happy when SysPid is otherwise unused in this file
 #[allow(dead_code)]
 fn _suppress_unused(_: SysPid) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opts_clamps_max_kills_at_hard_ceiling() {
+        let o = Opts::new(6.0, 0.5, 9999, true, true);
+        assert_eq!(
+            o.max_kills, MAX_KILLS_HARD,
+            "Opts::new must clamp max_kills at the hard ceiling regardless of caller input"
+        );
+    }
+
+    #[test]
+    fn opts_preserves_max_kills_below_ceiling() {
+        let o = Opts::new(6.0, 0.5, 3, false, false);
+        assert_eq!(o.max_kills, 3);
+        assert!(!o.dry_run);
+        assert!(!o.require_no_tty);
+    }
+
+    #[test]
+    fn opts_converts_hours_to_seconds() {
+        let o = Opts::new(2.5, 0.5, 5, true, true);
+        assert_eq!(o.min_age_sec, 9000);
+    }
+
+    #[test]
+    fn allowlist_contains_known_clis() {
+        assert!(ALLOWLIST.contains(&"claude"));
+        assert!(ALLOWLIST.contains(&"codex"));
+        assert!(ALLOWLIST.contains(&"kiro-cli"));
+        assert!(ALLOWLIST.contains(&"kiro-cli-chat"));
+        // Names the janitor must NEVER touch:
+        assert!(!ALLOWLIST.contains(&"node"));
+        assert!(!ALLOWLIST.contains(&"bun"));
+        assert!(!ALLOWLIST.contains(&"python"));
+        assert!(!ALLOWLIST.contains(&"bash"));
+    }
+
+    #[test]
+    fn proc_has_no_tty_unknown_pid_returns_false() {
+        // pid 0 / nonexistent → conservative: treat as having a TTY.
+        assert!(!proc_has_no_tty(0));
+    }
+}

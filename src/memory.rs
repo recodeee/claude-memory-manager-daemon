@@ -47,7 +47,10 @@ pub fn stat(root: &Path) -> MemoryStat {
         }
     }
     s.newest_mtime_unix = newest;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     s.idle_sec = now.saturating_sub(newest);
 
     // Line count of MEMORY.md, if present.
@@ -57,4 +60,47 @@ pub fn stat(root: &Path) -> MemoryStat {
     }
 
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn unique_tmp(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("cmmd-memtest-{}-{}", std::process::id(), name));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn stat_nonexistent_dir_marks_exists_false() {
+        let p = std::env::temp_dir().join("cmmd-memtest-nonexistent-xyz");
+        let _ = fs::remove_dir_all(&p);
+        let s = stat(&p);
+        assert!(!s.exists);
+        assert_eq!(s.file_count, 0);
+    }
+
+    #[test]
+    fn stat_counts_files_and_bytes() {
+        let p = unique_tmp("counts");
+        fs::write(p.join("a.md"), "hello").unwrap();
+        fs::write(p.join("b.md"), "world!").unwrap();
+        let s = stat(&p);
+        assert!(s.exists);
+        assert_eq!(s.file_count, 2);
+        assert_eq!(s.total_bytes, 11);
+        let _ = fs::remove_dir_all(&p);
+    }
+
+    #[test]
+    fn stat_picks_up_memory_md_line_count() {
+        let p = unique_tmp("memmd");
+        fs::write(p.join("MEMORY.md"), "line 1\nline 2\nline 3\n").unwrap();
+        let s = stat(&p);
+        assert_eq!(s.memory_md_lines, Some(3));
+        let _ = fs::remove_dir_all(&p);
+    }
 }

@@ -16,13 +16,25 @@ use std::process::{Command, Stdio};
 use claude_memory_manager_daemon::ipc;
 
 #[derive(Parser)]
-#[command(name = "mmctl", version, about = "Control + inspect the claude-memory-manager-daemon")]
+#[command(
+    name = "mmctl",
+    version,
+    about = "Control + inspect the claude-memory-manager-daemon"
+)]
 struct Cli {
     /// Daemon's Unix socket path.
-    #[arg(long, env = "STATUS_SOCK", default_value = "/tmp/claude-memory-manager.sock")]
+    #[arg(
+        long,
+        env = "STATUS_SOCK",
+        default_value = "/tmp/claude-memory-manager.sock"
+    )]
     sock: PathBuf,
     /// Daemon's log file (used by `logs`).
-    #[arg(long, env = "LOG_FILE", default_value = "/tmp/claude-memory-manager.log")]
+    #[arg(
+        long,
+        env = "LOG_FILE",
+        default_value = "/tmp/claude-memory-manager.log"
+    )]
     log_file: PathBuf,
 
     #[command(subcommand)]
@@ -149,7 +161,9 @@ async fn cmd_accounts(sock: &Path, args: AccountsArgs) -> Result<()> {
     if let Some(query) = args.switch {
         // Switch via authmux directly — does not need the daemon.
         let status = Command::new("authmux").arg("switch").arg(&query).status()?;
-        if !status.success() { return Err(anyhow!("authmux switch failed")); }
+        if !status.success() {
+            return Err(anyhow!("authmux switch failed"));
+        }
         return Ok(());
     }
     let s = fetch_status(sock).await?;
@@ -170,14 +184,16 @@ async fn cmd_last_tick(sock: &Path) -> Result<()> {
 }
 
 async fn cmd_ping(sock: &Path) -> Result<()> {
-    let reply = ipc::send_command(sock, "ping").await
+    let reply = ipc::send_command(sock, "ping")
+        .await
         .with_context(|| format!("daemon not reachable on {}", sock.display()))?;
     print!("{reply}");
     Ok(())
 }
 
 async fn cmd_tick(sock: &Path) -> Result<()> {
-    let reply = ipc::send_command(sock, "tick").await
+    let reply = ipc::send_command(sock, "tick")
+        .await
         .with_context(|| format!("daemon not reachable on {}", sock.display()))?;
     print!("{reply}");
     Ok(())
@@ -185,8 +201,8 @@ async fn cmd_tick(sock: &Path) -> Result<()> {
 
 async fn cmd_dry_run(sock: &Path, state: &str) -> Result<()> {
     let cmd = match state.to_lowercase().as_str() {
-        "on" | "true"  | "1" => "dry-run-on",
-        "off"| "false" | "0" => "dry-run-off",
+        "on" | "true" | "1" => "dry-run-on",
+        "off" | "false" | "0" => "dry-run-off",
         other => return Err(anyhow!("unknown state '{other}', want on|off")),
     };
     let reply = ipc::send_command(sock, cmd).await?;
@@ -199,10 +215,16 @@ async fn cmd_dry_run(sock: &Path, state: &str) -> Result<()> {
 fn cmd_logs(log_file: &Path, lines: usize, follow: bool) -> Result<()> {
     let mut c = Command::new("tail");
     c.arg("-n").arg(lines.to_string());
-    if follow { c.arg("-f"); }
+    if follow {
+        c.arg("-f");
+    }
     c.arg(log_file);
-    let status = c.status().with_context(|| format!("spawn tail {}", log_file.display()))?;
-    if !status.success() { return Err(anyhow!("tail exited non-zero")); }
+    let status = c
+        .status()
+        .with_context(|| format!("spawn tail {}", log_file.display()))?;
+    if !status.success() {
+        return Err(anyhow!("tail exited non-zero"));
+    }
     Ok(())
 }
 
@@ -211,20 +233,39 @@ fn cmd_logs(log_file: &Path, lines: usize, follow: bool) -> Result<()> {
 fn cmd_janitor(action: JanitorCmd) -> Result<()> {
     let cmmd = locate_cmmd()?;
     match action {
-        JanitorCmd::List { min_age_hours, json } => {
+        JanitorCmd::List {
+            min_age_hours,
+            json,
+        } => {
             let mut c = Command::new(&cmmd);
-            c.arg("janitor").arg("list")
-                .arg("--min-age-hours").arg(min_age_hours.to_string());
-            if json { c.arg("--json"); }
+            c.arg("janitor")
+                .arg("list")
+                .arg("--min-age-hours")
+                .arg(min_age_hours.to_string());
+            if json {
+                c.arg("--json");
+            }
             run_inherit(c)
         }
-        JanitorCmd::Apply { min_age_hours, max, no_dry_run, json } => {
+        JanitorCmd::Apply {
+            min_age_hours,
+            max,
+            no_dry_run,
+            json,
+        } => {
             let mut c = Command::new(&cmmd);
-            c.arg("janitor").arg("apply")
-                .arg("--min-age-hours").arg(min_age_hours.to_string())
-                .arg("--max").arg(max.to_string());
-            if no_dry_run { c.arg("--no-dry-run"); }
-            if json { c.arg("--json"); }
+            c.arg("janitor")
+                .arg("apply")
+                .arg("--min-age-hours")
+                .arg(min_age_hours.to_string())
+                .arg("--max")
+                .arg(max.to_string());
+            if no_dry_run {
+                c.arg("--no-dry-run");
+            }
+            if json {
+                c.arg("--json");
+            }
             run_inherit(c)
         }
     }
@@ -235,16 +276,24 @@ fn locate_cmmd() -> Result<PathBuf> {
     if let Ok(me) = std::env::current_exe() {
         if let Some(parent) = me.parent() {
             let sib = parent.join("cmmd");
-            if sib.is_file() { return Ok(sib); }
+            if sib.is_file() {
+                return Ok(sib);
+            }
         }
     }
     Ok(PathBuf::from("cmmd"))
 }
 
 fn run_inherit(mut c: Command) -> Result<()> {
-    let status = c.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit())
-        .status().with_context(|| format!("spawn {:?}", c.get_program()))?;
-    if !status.success() { return Err(anyhow!("subprocess exited {:?}", status.code())); }
+    let status = c
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("spawn {:?}", c.get_program()))?;
+    if !status.success() {
+        return Err(anyhow!("subprocess exited {:?}", status.code()));
+    }
     Ok(())
 }
 
@@ -265,25 +314,33 @@ fn cmd_plugins(action: PluginsCmd) -> Result<()> {
             let enabled = list_dirs(&skills_root())?;
             let disabled = list_dirs(&disabled_root()).unwrap_or_default();
             println!("enabled skills ({}):", enabled.len());
-            for d in &enabled { println!("  - {d}"); }
+            for d in &enabled {
+                println!("  - {d}");
+            }
             println!("\ndisabled skills ({}):", disabled.len());
-            for d in &disabled { println!("  - {d}"); }
+            for d in &disabled {
+                println!("  - {d}");
+            }
             Ok(())
         }
         PluginsCmd::Install { source } => plugin_install(&source),
         PluginsCmd::Remove { name } => plugin_remove(&name),
         PluginsCmd::Disable { name } => plugin_move(&name, &skills_root(), &disabled_root()),
-        PluginsCmd::Enable  { name } => plugin_move(&name, &disabled_root(), &skills_root()),
+        PluginsCmd::Enable { name } => plugin_move(&name, &disabled_root(), &skills_root()),
     }
 }
 
 fn list_dirs(root: &Path) -> Result<Vec<String>> {
-    if !root.exists() { return Ok(vec![]); }
+    if !root.exists() {
+        return Ok(vec![]);
+    }
     let mut out = Vec::new();
     for e in std::fs::read_dir(root)? {
         let e = e?;
         if e.file_type()?.is_dir() {
-            if let Some(s) = e.file_name().to_str() { out.push(s.to_string()); }
+            if let Some(s) = e.file_name().to_str() {
+                out.push(s.to_string());
+            }
         }
     }
     out.sort();
@@ -296,22 +353,42 @@ fn plugin_install(source: &str) -> Result<()> {
     if source.starts_with("http") || source.starts_with("git@") {
         let tmp = std::env::temp_dir().join(format!("cmmd-plugin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let status = Command::new("git").arg("clone").arg("--depth").arg("1")
-            .arg(source).arg(&tmp).status()
+        let status = Command::new("git")
+            .arg("clone")
+            .arg("--depth")
+            .arg("1")
+            .arg(source)
+            .arg(&tmp)
+            .status()
             .context("git clone")?;
-        if !status.success() { return Err(anyhow!("git clone failed")); }
-        let name = tmp.file_name().and_then(|s| s.to_str()).unwrap_or("plugin").to_string();
+        if !status.success() {
+            return Err(anyhow!("git clone failed"));
+        }
+        let name = tmp
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("plugin")
+            .to_string();
         let dst = dst_root.join(&name);
-        if dst.exists() { return Err(anyhow!("plugin already installed at {}", dst.display())); }
+        if dst.exists() {
+            return Err(anyhow!("plugin already installed at {}", dst.display()));
+        }
         std::fs::rename(&tmp, &dst)?;
         println!("installed → {}", dst.display());
         Ok(())
     } else {
         let src = PathBuf::from(source);
-        if !src.is_dir() { return Err(anyhow!("not a directory: {source}")); }
-        let name = src.file_name().and_then(|s| s.to_str()).ok_or_else(|| anyhow!("bad source name"))?;
+        if !src.is_dir() {
+            return Err(anyhow!("not a directory: {source}"));
+        }
+        let name = src
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| anyhow!("bad source name"))?;
         let dst = dst_root.join(name);
-        if dst.exists() { return Err(anyhow!("plugin already installed at {}", dst.display())); }
+        if dst.exists() {
+            return Err(anyhow!("plugin already installed at {}", dst.display()));
+        }
         copy_dir(&src, &dst)?;
         println!("installed → {}", dst.display());
         Ok(())
@@ -328,16 +405,22 @@ fn plugin_remove(name: &str) -> Result<()> {
             removed += 1;
         }
     }
-    if removed == 0 { return Err(anyhow!("no skill named '{name}'")); }
+    if removed == 0 {
+        return Err(anyhow!("no skill named '{name}'"));
+    }
     Ok(())
 }
 
 fn plugin_move(name: &str, from: &Path, to: &Path) -> Result<()> {
     let src = from.join(name);
-    if !src.exists() { return Err(anyhow!("not found: {}", src.display())); }
+    if !src.exists() {
+        return Err(anyhow!("not found: {}", src.display()));
+    }
     std::fs::create_dir_all(to)?;
     let dst = to.join(name);
-    if dst.exists() { return Err(anyhow!("already at {}", dst.display())); }
+    if dst.exists() {
+        return Err(anyhow!("already at {}", dst.display()));
+    }
     std::fs::rename(&src, &dst)?;
     println!("{} → {}", src.display(), dst.display());
     Ok(())

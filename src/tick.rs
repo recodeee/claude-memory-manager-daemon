@@ -12,6 +12,7 @@ use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::time::timeout;
 use tracing::{info, warn};
 
 pub struct TickOutcome {
@@ -22,16 +23,37 @@ pub struct TickOutcome {
 
 pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOutcome> {
     // Coordination guards — never race a live session.
-    let live = crate::process::find_claude_sessions();
-    // The daemon itself may spawn a `claude` subprocess, which is fine — but
-    // any OTHER claude/cli must mean a human-driven session, so we yield.
-    let other_sessions = live.len();
-    if other_sessions > 0 {
-        return Ok(TickOutcome {
-            ran: false,
-            reason_skipped: Some(format!("{other_sessions} live claude session(s) detected")),
-            exit_code: None,
-        });
+    //
+    // Strategy: ask lsof which (foreign) PIDs currently hold a file under
+    // MEMORY_ROOT open. If lsof is unavailable, fall back to the conservative
+    // process-name guard (any other claude/kiro process aborts the tick).
+    match crate::process::memory_holders(&cfg.memory_root) {
+        Ok(holders) if !holders.is_empty() => {
+            let names: Vec<String> = holders
+                .iter()
+                .map(|h| format!("{}({})", h.name, h.pid))
+                .collect();
+            return Ok(TickOutcome {
+                ran: false,
+                reason_skipped: Some(format!("memory files open by: {}", names.join(", "))),
+                exit_code: None,
+            });
+        }
+        Ok(_) => { /* nobody holds memory open — proceed */ }
+        Err(e) => {
+            warn!("lsof unavailable ({e}); falling back to process-name guard");
+            let live = crate::process::find_claude_sessions();
+            if !live.is_empty() {
+                return Ok(TickOutcome {
+                    ran: false,
+                    reason_skipped: Some(format!(
+                        "{} live claude session(s) detected (lsof fallback)",
+                        live.len()
+                    )),
+                    exit_code: None,
+                });
+            }
+        }
     }
 
     if mem.idle_sec < cfg.min_idle.as_secs() {
@@ -39,7 +61,8 @@ pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOu
             ran: false,
             reason_skipped: Some(format!(
                 "memory dir mutated {}s ago (< MIN_IDLE_SEC={})",
-                mem.idle_sec, cfg.min_idle.as_secs()
+                mem.idle_sec,
+                cfg.min_idle.as_secs()
             )),
             exit_code: None,
         });
@@ -51,10 +74,13 @@ pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOu
     let mut cmd = Command::new(&cfg.claude_bin);
     cmd.arg("-p")
         .arg(&prompt)
-        .arg("--model").arg(&cfg.model)
-        .arg("--output-format").arg("stream-json")
+        .arg("--model")
+        .arg(&cfg.model)
+        .arg("--output-format")
+        .arg("stream-json")
         .arg("--include-partial-messages")
-        .arg("--max-turns").arg(cfg.max_turns.to_string())
+        .arg("--max-turns")
+        .arg(cfg.max_turns.to_string())
         .arg("--verbose")
         // Working directory = repo root so .claude/agents and .claude/skills resolve.
         .current_dir(cwd_or_repo()?)
@@ -74,26 +100,57 @@ pub async fn run(cfg: &Config, dry_run: bool, mem: &MemoryStat) -> Result<TickOu
         cmd.env("CLAUDE_CONFIG_DIR", dir);
     }
 
-    let mut child = cmd.spawn().with_context(|| format!("spawn {}", cfg.claude_bin))?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn {}", cfg.claude_bin))?;
     let stdout = child.stdout.take().context("claude stdout missing")?;
     let stderr = child.stderr.take().context("claude stderr missing")?;
 
     let stdout_task = tokio::spawn(stream_lines("stdout", stdout, true));
     let stderr_task = tokio::spawn(stream_lines("stderr", stderr, false));
 
-    let status = child.wait().await?;
+    // Tick timeout: if the claude child hasn't finished by `cfg.max_tick`,
+    // send SIGTERM, give it 10s, then SIGKILL. Surfaces a hang in the log
+    // instead of stalling every subsequent tick request.
+    let status = match timeout(cfg.max_tick, child.wait()).await {
+        Ok(res) => res?,
+        Err(_elapsed) => {
+            warn!(
+                secs = cfg.max_tick.as_secs(),
+                "tick exceeded max_tick — sending SIGTERM"
+            );
+            if let Some(pid) = child.id() {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
+            }
+            match timeout(std::time::Duration::from_secs(10), child.wait()).await {
+                Ok(res) => res?,
+                Err(_) => {
+                    warn!("child still alive after SIGTERM grace — SIGKILL");
+                    let _ = child.start_kill();
+                    child.wait().await?
+                }
+            }
+        }
+    };
     let _ = stdout_task.await;
     let _ = stderr_task.await;
 
     if !status.success() {
         warn!(code = ?status.code(), "claude exited non-zero");
     }
-    Ok(TickOutcome { ran: true, reason_skipped: None, exit_code: status.code() })
+    Ok(TickOutcome {
+        ran: true,
+        reason_skipped: None,
+        exit_code: status.code(),
+    })
 }
 
 fn build_prompt(cfg: &Config, dry_run: bool) -> String {
     format!(
-"You are the memory-manager daemon tick agent.
+        "You are the memory-manager daemon tick agent.
 
 MEMORY_ROOT: {memory_root}
 DRY_RUN: {dry_run}
@@ -121,13 +178,18 @@ fn cwd_or_repo() -> Result<std::path::PathBuf> {
     Ok(std::env::current_dir()?)
 }
 
-async fn stream_lines<R: tokio::io::AsyncRead + Unpin>(tag: &'static str, reader: R, parse_json: bool) {
+async fn stream_lines<R: tokio::io::AsyncRead + Unpin>(
+    tag: &'static str,
+    reader: R,
+    parse_json: bool,
+) {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if parse_json {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 if let Some(role) = v.get("type").and_then(|x| x.as_str()) {
-                    let preview = v.get("message")
+                    let preview = v
+                        .get("message")
                         .and_then(|m| m.get("content"))
                         .and_then(|c| c.get(0))
                         .and_then(|b| b.get("text"))

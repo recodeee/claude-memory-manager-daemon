@@ -40,14 +40,20 @@ pub fn acquire_lock(lock_file: &Path, pid_file: &Path) -> Result<()> {
         if let Ok(pid) = pid_str.trim().parse::<i32>() {
             // signal 0 = existence probe
             if unsafe { libc_kill(pid, 0) } == 0 {
-                return Err(anyhow!("another daemon holds {} (pid={})", lock_file.display(), pid));
+                return Err(anyhow!(
+                    "another daemon holds {} (pid={})",
+                    lock_file.display(),
+                    pid
+                ));
             }
         }
         let _ = std::fs::remove_file(lock_file);
     }
     let me = std::process::id();
-    std::fs::write(lock_file, me.to_string()).with_context(|| format!("write {}", lock_file.display()))?;
-    std::fs::write(pid_file, me.to_string()).with_context(|| format!("write {}", pid_file.display()))?;
+    std::fs::write(lock_file, me.to_string())
+        .with_context(|| format!("write {}", lock_file.display()))?;
+    std::fs::write(pid_file, me.to_string())
+        .with_context(|| format!("write {}", pid_file.display()))?;
     Ok(())
 }
 
@@ -59,7 +65,9 @@ pub fn release_lock(lock_file: &Path, pid_file: &Path) {
 extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
 }
-unsafe fn libc_kill(pid: i32, sig: i32) -> i32 { kill(pid, sig) }
+unsafe fn libc_kill(pid: i32, sig: i32) -> i32 {
+    kill(pid, sig)
+}
 
 /// Daemon-side handles exposed to clients via the Unix socket.
 #[derive(Clone)]
@@ -69,16 +77,21 @@ pub struct DaemonHandles {
     pub tick_now: Arc<Notify>,
     /// Toggle DRY_RUN at runtime. Returns the new value.
     pub dry_run: Arc<tokio::sync::Mutex<bool>>,
+    /// Where to persist runtime overrides on toggle.
+    pub state_file: std::path::PathBuf,
 }
 
 pub async fn serve_status(sock_path: std::path::PathBuf, handles: DaemonHandles) -> Result<()> {
     let _ = std::fs::remove_file(&sock_path);
-    let listener = UnixListener::bind(&sock_path)
-        .with_context(|| format!("bind {}", sock_path.display()))?;
+    let listener =
+        UnixListener::bind(&sock_path).with_context(|| format!("bind {}", sock_path.display()))?;
     loop {
         let (mut stream, _) = match listener.accept().await {
             Ok(c) => c,
-            Err(e) => { tracing::warn!("accept err: {e}"); continue; }
+            Err(e) => {
+                tracing::warn!("accept err: {e}");
+                continue;
+            }
         };
         let h = handles.clone();
         tokio::spawn(async move {
@@ -102,26 +115,45 @@ async fn handle_client(stream: &mut UnixStream, handles: DaemonHandles) -> Resul
         }
         "tick" => {
             handles.tick_now.notify_one();
-            stream.write_all(b"{\"ok\":true,\"action\":\"tick\"}\n").await?;
+            stream
+                .write_all(b"{\"ok\":true,\"action\":\"tick\"}\n")
+                .await?;
         }
         "dry-run-on" => {
             *handles.dry_run.lock().await = true;
-            stream.write_all(b"{\"ok\":true,\"dry_run\":true}\n").await?;
+            persist_dry_run(&handles.state_file, Some(true));
+            stream
+                .write_all(b"{\"ok\":true,\"dry_run\":true,\"persisted\":true}\n")
+                .await?;
         }
         "dry-run-off" => {
             *handles.dry_run.lock().await = false;
-            stream.write_all(b"{\"ok\":true,\"dry_run\":false}\n").await?;
+            persist_dry_run(&handles.state_file, Some(false));
+            stream
+                .write_all(b"{\"ok\":true,\"dry_run\":false,\"persisted\":true}\n")
+                .await?;
         }
         other => {
-            stream.write_all(format!("{{\"ok\":false,\"error\":\"unknown:{other}\"}}\n").as_bytes()).await?;
+            stream
+                .write_all(format!("{{\"ok\":false,\"error\":\"unknown:{other}\"}}\n").as_bytes())
+                .await?;
         }
     }
     Ok(())
 }
 
+fn persist_dry_run(state_file: &Path, value: Option<bool>) {
+    let mut s = crate::state::load(state_file);
+    s.dry_run_override = value;
+    if let Err(e) = crate::state::save(state_file, &s) {
+        tracing::warn!("persist dry_run failed: {e}");
+    }
+}
+
 /// Send a command and read the response (raw text). Used by mmctl.
 pub async fn send_command(sock_path: &Path, cmd: &str) -> Result<String> {
-    let mut stream = UnixStream::connect(sock_path).await
+    let mut stream = UnixStream::connect(sock_path)
+        .await
         .with_context(|| format!("connect {}", sock_path.display()))?;
     stream.write_all(cmd.as_bytes()).await?;
     stream.shutdown().await.ok();
@@ -138,4 +170,6 @@ pub async fn query_status(sock_path: &Path) -> Result<DaemonStatus> {
 
 // Silence "unused import" if anyhow!() is not used elsewhere in this file.
 #[allow(dead_code)]
-fn _suppress() -> anyhow::Error { anyhow!("unused") }
+fn _suppress() -> anyhow::Error {
+    anyhow!("unused")
+}
