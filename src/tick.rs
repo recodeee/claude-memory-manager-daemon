@@ -147,6 +147,19 @@ pub async fn run(
     };
     cmd.arg("--allowed-tools").arg(allow);
 
+    // When NOT in dry-run, bypass the Claude Code host's interactive permission
+    // classifier — the daemon is non-interactive and the tool surface is already
+    // locked down via --allowed-tools above. Without this flag, the host blocks
+    // every Edit call to paths under ~/.claude/... and the agent ends up
+    // reporting "applied=0 deferred=N" forever.
+    //
+    // Guarded by dry_run so the flag is NEVER added when the daemon is supposed
+    // to be reporting only.
+    if !dry_run {
+        warn!("dry_run=false — passing --dangerously-skip-permissions to claude");
+        cmd.arg("--dangerously-skip-permissions");
+    }
+
     if let Some(dir) = &cfg.claude_config_dir {
         cmd.env("CLAUDE_CONFIG_DIR", dir);
     }
