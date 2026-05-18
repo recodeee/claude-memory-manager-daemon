@@ -40,6 +40,7 @@ pub async fn run(
     memory_root: &Path,
     dry_run: bool,
     mem: &MemoryStat,
+    tick_id: &str,
 ) -> Result<TickOutcome> {
     // Coordination guards — never race a live session.
     //
@@ -156,8 +157,24 @@ pub async fn run(
     let stdout = child.stdout.take().context("claude stdout missing")?;
     let stderr = child.stderr.take().context("claude stderr missing")?;
 
-    let stdout_task = tokio::spawn(stream_lines("stdout", stdout, true));
-    let stderr_task = tokio::spawn(stream_lines("stderr", stderr, false));
+    // Per-tick transcript path. We tee every line we read from claude into
+    // this file so post-mortem is possible even after the tick scrolls off
+    // the daemon log. mmctl tick-log <tick_id> reads it back.
+    let transcript = std::path::PathBuf::from(format!("/tmp/cmmd-tick-{tick_id}.log"));
+    info!(transcript = %transcript.display(), "writing tick transcript");
+
+    let stdout_task = tokio::spawn(stream_lines(
+        "stdout",
+        stdout,
+        true,
+        Some(transcript.clone()),
+    ));
+    let stderr_task = tokio::spawn(stream_lines(
+        "stderr",
+        stderr,
+        false,
+        Some(transcript.clone()),
+    ));
 
     // Tick timeout: if the claude child hasn't finished by `cfg.max_tick`,
     // send SIGTERM, give it 10s, then SIGKILL. Surfaces a hang in the log
@@ -244,9 +261,23 @@ async fn stream_lines<R: tokio::io::AsyncRead + Unpin>(
     tag: &'static str,
     reader: R,
     parse_json: bool,
+    transcript: Option<std::path::PathBuf>,
 ) {
+    // Open the transcript once; append every line we see. Best-effort — a
+    // failed open just means no transcript for this tick.
+    let mut transcript_handle = transcript.and_then(|p| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+            .ok()
+    });
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(f) = transcript_handle.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(f, "[{tag}] {line}");
+        }
         if parse_json {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 if let Some(role) = v.get("type").and_then(|x| x.as_str()) {

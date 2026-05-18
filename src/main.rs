@@ -68,6 +68,8 @@ enum Cmd {
         /// SHA from `cmmd git-log`. Must be a real commit on the MEMORY_ROOT git.
         sha: String,
     },
+    /// `git -C MEMORY_ROOT diff <sha>` — preview what `restore <sha>` would change.
+    Diff { sha: String },
 }
 
 #[derive(Subcommand)]
@@ -121,7 +123,27 @@ async fn main() -> Result<()> {
         Cmd::History { lines, json } => run_history(cfg, lines, json),
         Cmd::GitLog { lines } => run_git_log(cfg, lines),
         Cmd::Restore { sha } => run_restore(cfg, sha),
+        Cmd::Diff { sha } => run_diff(cfg, sha),
     }
+}
+
+fn run_diff(cfg: config::Config, sha: String) -> Result<()> {
+    if !cfg.memory_root.join(".git").exists() {
+        return Err(anyhow::anyhow!(
+            "{} is not a git repo — nothing to diff",
+            cfg.memory_root.display()
+        ));
+    }
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&cfg.memory_root)
+        .arg("diff")
+        .arg(&sha)
+        .status()?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("git diff exited non-zero"));
+    }
+    Ok(())
 }
 
 fn run_history(cfg: config::Config, n: usize, json: bool) -> Result<()> {
@@ -479,8 +501,9 @@ async fn main_loop(
                 state.write().await.memory = serde_json::to_value(&mem)?;
             }
             info!(root = %root.display(), "tending memory root");
+            let tick_id = history::new_tick_id();
 
-            let outcome = match tick::run(&cfg, root, dry_run_now, &mem).await {
+            let outcome = match tick::run(&cfg, root, dry_run_now, &mem, &tick_id).await {
                 Ok(o) => o,
                 Err(e) => {
                     error!(root = %root.display(), "tick error: {e:#}");
@@ -515,7 +538,7 @@ async fn main_loop(
             }
 
             let hist_rec = history::TickRecord {
-                tick_id: history::new_tick_id(),
+                tick_id: tick_id.clone(),
                 started_at_unix: tick_started,
                 finished_at_unix: now,
                 dry_run: dry_run_now,

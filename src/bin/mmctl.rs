@@ -54,7 +54,15 @@ enum Cmd {
     /// Liveness probe.
     Ping,
     /// Trigger an immediate tick (bypasses the inter-tick sleep).
-    Tick,
+    Tick {
+        /// Block until the daemon reports a finished tick newer than
+        /// the one in state at request time. Max-wait is bounded by --timeout.
+        #[arg(long)]
+        wait: bool,
+        /// Wait timeout in seconds when --wait is set.
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+    },
     /// Toggle runtime dry-run mode on the running daemon.
     DryRun {
         /// "on" or "off".
@@ -88,8 +96,12 @@ enum Cmd {
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: usize,
     },
+    /// git diff MEMORY_ROOT against a snapshot SHA. Preview before restore.
+    Diff { sha: String },
     /// Reset MEMORY_ROOT to a prior snapshot (destructive).
     Restore { sha: String },
+    /// Print the full agent transcript for a tick (from /tmp/cmmd-tick-&lt;id&gt;.log).
+    TickLog { tick_id: String },
     /// Process janitor: list / clean stale claude/codex/kiro sessions.
     Janitor {
         #[command(subcommand)]
@@ -156,13 +168,15 @@ async fn main() -> Result<()> {
         Cmd::Memory => cmd_memory(&cli.sock).await,
         Cmd::LastTick => cmd_last_tick(&cli.sock).await,
         Cmd::Ping => cmd_ping(&cli.sock).await,
-        Cmd::Tick => cmd_tick(&cli.sock).await,
+        Cmd::Tick { wait, timeout } => cmd_tick(&cli.sock, wait, timeout).await,
         Cmd::DryRun { state } => cmd_dry_run(&cli.sock, &state).await,
         Cmd::Logs { lines, follow } => cmd_logs(&cli.log_file, lines, follow),
         Cmd::Audit { memory_root, json } => cmd_audit(memory_root, json),
         Cmd::History { lines, json } => cmd_proxy_history(lines, json),
         Cmd::GitLog { lines } => cmd_proxy_git_log(lines),
+        Cmd::Diff { sha } => cmd_proxy_diff(sha),
         Cmd::Restore { sha } => cmd_proxy_restore(sha),
+        Cmd::TickLog { tick_id } => cmd_tick_log(tick_id),
         Cmd::Janitor { action } => cmd_janitor(action),
         Cmd::Plugins { action } => cmd_plugins(action),
     }
@@ -253,11 +267,69 @@ async fn cmd_ping(sock: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_tick(sock: &Path) -> Result<()> {
+async fn cmd_tick(sock: &Path, wait: bool, timeout_sec: u64) -> Result<()> {
+    // Snapshot the current last-tick stamp so we know what to wait past.
+    let before = ipc::query_status(sock)
+        .await
+        .with_context(|| format!("daemon not reachable on {}", sock.display()))?;
+    let before_finished = before
+        .last_tick
+        .as_ref()
+        .map(|t| t.finished_at_unix)
+        .unwrap_or(0);
+
     let reply = ipc::send_command(sock, "tick")
         .await
         .with_context(|| format!("daemon not reachable on {}", sock.display()))?;
     print!("{reply}");
+
+    if !wait {
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_sec);
+    let mut poll = std::time::Duration::from_millis(250);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "--wait timed out after {timeout_sec}s without a fresh tick"
+            ));
+        }
+        tokio::time::sleep(poll).await;
+        // Exponential-ish backoff capped at 2s so we don't hammer the socket.
+        poll = (poll * 2).min(std::time::Duration::from_secs(2));
+
+        let now_status = match ipc::query_status(sock).await {
+            Ok(s) => s,
+            Err(_) => continue, // transient
+        };
+        let after_finished = now_status
+            .last_tick
+            .as_ref()
+            .map(|t| t.finished_at_unix)
+            .unwrap_or(0);
+        if after_finished > before_finished {
+            println!("{}", serde_json::to_string_pretty(&now_status.last_tick)?);
+            return Ok(());
+        }
+    }
+}
+
+fn cmd_proxy_diff(sha: String) -> Result<()> {
+    let cmmd = locate_cmmd()?;
+    let mut c = Command::new(&cmmd);
+    c.arg("diff").arg(sha);
+    run_inherit(c)
+}
+
+fn cmd_tick_log(tick_id: String) -> Result<()> {
+    let path = std::path::PathBuf::from(format!("/tmp/cmmd-tick-{tick_id}.log"));
+    if !path.exists() {
+        return Err(anyhow!("no transcript at {}", path.display()));
+    }
+    let status = Command::new("cat").arg(&path).status().context("cat")?;
+    if !status.success() {
+        return Err(anyhow!("cat exited non-zero"));
+    }
     Ok(())
 }
 
