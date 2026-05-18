@@ -31,6 +31,17 @@ pub struct Metrics {
     pub ticks_blocked_daily_cap_total: AtomicU64,
     pub ticks_reverted_fix_cap_total: AtomicU64,
     pub day_ticks_ran: AtomicU64,
+    // Housekeeper visibility. One counter per kind, summed across ticks.
+    // The render layer emits them as a single Prometheus metric with a
+    // `kind` label so dashboards can filter cleanly. A "dry_run" variant
+    // is published separately so an operator can see what *would* have
+    // been killed without enabling kills.
+    pub housekeeper_kills_tmux_total: AtomicU64,
+    pub housekeeper_kills_orphan_node_total: AtomicU64,
+    pub housekeeper_actions_pressure_total: AtomicU64,
+    pub housekeeper_dryrun_tmux_total: AtomicU64,
+    pub housekeeper_dryrun_orphan_node_total: AtomicU64,
+    pub housekeeper_dryrun_pressure_total: AtomicU64,
 }
 
 impl Metrics {
@@ -88,6 +99,32 @@ impl Metrics {
 
     pub fn set_day_ticks_ran(&self, n: u64) {
         self.day_ticks_ran.store(n, Ordering::Relaxed);
+    }
+
+    /// Record housekeeper kill/action counts for this tick. Pass the count
+    /// for each kind; pass 0 for kinds that did nothing.
+    pub fn record_housekeeper(
+        &self,
+        dry_run: bool,
+        tmux: u64,
+        orphan_node: u64,
+        pressure: u64,
+    ) {
+        if dry_run {
+            self.housekeeper_dryrun_tmux_total
+                .fetch_add(tmux, Ordering::Relaxed);
+            self.housekeeper_dryrun_orphan_node_total
+                .fetch_add(orphan_node, Ordering::Relaxed);
+            self.housekeeper_dryrun_pressure_total
+                .fetch_add(pressure, Ordering::Relaxed);
+        } else {
+            self.housekeeper_kills_tmux_total
+                .fetch_add(tmux, Ordering::Relaxed);
+            self.housekeeper_kills_orphan_node_total
+                .fetch_add(orphan_node, Ordering::Relaxed);
+            self.housekeeper_actions_pressure_total
+                .fetch_add(pressure, Ordering::Relaxed);
+        }
     }
 
     /// `tick_interval_sec` lets the exporter publish a derived gauge for
@@ -197,6 +234,40 @@ impl Metrics {
             "cmmd_day_ticks_ran {}\n",
             self.day_ticks_ran.load(Ordering::Relaxed)
         ));
+        // One labeled metric per housekeeper kind. Two label dimensions:
+        // `kind` (which housekeeper) and `mode` (real / dry_run).
+        out.push_str(
+            "# HELP cmmd_housekeeper_actions_total Kills/actions taken by housekeepers. Labels: kind, mode.\n",
+        );
+        out.push_str("# TYPE cmmd_housekeeper_actions_total counter\n");
+        for (kind, real, dryrun) in [
+            (
+                "tmux",
+                self.housekeeper_kills_tmux_total.load(Ordering::Relaxed),
+                self.housekeeper_dryrun_tmux_total.load(Ordering::Relaxed),
+            ),
+            (
+                "orphan_node",
+                self.housekeeper_kills_orphan_node_total
+                    .load(Ordering::Relaxed),
+                self.housekeeper_dryrun_orphan_node_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "pressure",
+                self.housekeeper_actions_pressure_total
+                    .load(Ordering::Relaxed),
+                self.housekeeper_dryrun_pressure_total
+                    .load(Ordering::Relaxed),
+            ),
+        ] {
+            out.push_str(&format!(
+                "cmmd_housekeeper_actions_total{{kind=\"{kind}\",mode=\"real\"}} {real}\n"
+            ));
+            out.push_str(&format!(
+                "cmmd_housekeeper_actions_total{{kind=\"{kind}\",mode=\"dry_run\"}} {dryrun}\n"
+            ));
+        }
         out
     }
 }
@@ -293,9 +364,43 @@ mod tests {
             "cmmd_history_appends_total",
             "cmmd_last_tick_unix",
             "cmmd_tick_staleness_seconds",
+            "cmmd_history_rotations_total",
+            "cmmd_tick_logs_swept_total",
+            "cmmd_git_gc_runs_total",
+            "cmmd_ticks_blocked_daily_cap_total",
+            "cmmd_ticks_reverted_fix_cap_total",
+            "cmmd_day_ticks_ran",
+            "cmmd_housekeeper_actions_total",
         ] {
             assert!(out.contains(name), "missing metric {name} in:\n{out}");
         }
+        // Housekeeper metric publishes both real and dry_run modes for each kind.
+        for kind in ["tmux", "orphan_node", "pressure"] {
+            for mode in ["real", "dry_run"] {
+                let needle = format!("kind=\"{kind}\",mode=\"{mode}\"");
+                assert!(
+                    out.contains(&needle),
+                    "missing housekeeper label combo {needle}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn housekeeper_counters_route_by_mode() {
+        let m = Metrics::default();
+        m.record_housekeeper(false, 2, 3, 0);
+        m.record_housekeeper(true, 1, 1, 5);
+        assert_eq!(m.housekeeper_kills_tmux_total.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            m.housekeeper_kills_orphan_node_total.load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(m.housekeeper_dryrun_tmux_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            m.housekeeper_dryrun_pressure_total.load(Ordering::Relaxed),
+            5
+        );
     }
 
     #[test]

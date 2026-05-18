@@ -58,7 +58,11 @@ fn parse_kb(line: &str) -> u64 {
 }
 
 /// Check RAM pressure and take actions if thresholds exceeded.
-pub fn check_and_respond() -> PressureResponse {
+///
+/// When `dry_run` is true the function still reports the actions it *would*
+/// take in `actions_taken`, but skips the side effects: no `docker container
+/// prune`, no `drop_caches`, no writes to `/proc/sys/vm/...`.
+pub fn check_and_respond(dry_run: bool) -> PressureResponse {
     let mem = read_meminfo();
     let mut actions = Vec::new();
 
@@ -70,32 +74,50 @@ pub fn check_and_respond() -> PressureResponse {
         };
     }
 
-    info!(used_pct = mem.used_pct, "RAM pressure detected");
+    info!(used_pct = mem.used_pct, dry_run, "RAM pressure detected");
 
     // Level 1: Prune stopped docker containers
-    if run_cmd("docker", &["container", "prune", "-f"]) {
+    if dry_run {
+        actions.push("docker container prune (dry-run)".into());
+    } else if run_cmd("docker", &["container", "prune", "-f"]) {
         actions.push("docker container prune".into());
     }
 
     // Level 2: Drop page cache (safe — kernel rebuilds as needed)
     if mem.used_pct >= CRITICAL_THRESHOLD_PCT {
-        // sync first to flush dirty pages
-        let _ = Command::new("sync").status();
-        if fs::write("/proc/sys/vm/drop_caches", "1").is_ok() {
-            actions.push("drop_caches=1".into());
+        if dry_run {
+            actions.push("drop_caches=1 (dry-run)".into());
         } else {
-            // Try via sudo
-            if run_cmd("sudo", &["sh", "-c", "echo 1 > /proc/sys/vm/drop_caches"]) {
-                actions.push("drop_caches=1 (sudo)".into());
+            // sync first to flush dirty pages
+            let _ = Command::new("sync").status();
+            if fs::write("/proc/sys/vm/drop_caches", "1").is_ok() {
+                actions.push("drop_caches=1".into());
+            } else {
+                // Try via sudo
+                if run_cmd("sudo", &["sh", "-c", "echo 1 > /proc/sys/vm/drop_caches"]) {
+                    actions.push("drop_caches=1 (sudo)".into());
+                }
             }
         }
     }
 
     // Level 3: Enforce swap tuning (in case it was reset)
-    enforce_swap_tuning(&mut actions);
+    if dry_run {
+        // Probe the current values without writing so the operator can see
+        // what the housekeeper would have changed.
+        for path in ["/proc/sys/vm/swappiness", "/proc/sys/vm/page-cluster"] {
+            let current = fs::read_to_string(path)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            actions.push(format!("{path}={current} (dry-run, no write)"));
+        }
+    } else {
+        enforce_swap_tuning(&mut actions);
+    }
 
     if !actions.is_empty() {
-        info!(actions = ?actions, "pressure response complete");
+        info!(actions = ?actions, dry_run, "pressure response complete");
     }
 
     PressureResponse {
