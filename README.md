@@ -1,3 +1,7 @@
+<p align="left">
+  <img src="assets/logo.svg" alt="claude-memory-manager-daemon" width="120" height="120">
+</p>
+
 # claude-memory-manager-daemon
 
 A Rust daemon that tends the Claude Code **file-based memory lane**
