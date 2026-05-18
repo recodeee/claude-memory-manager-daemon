@@ -1,0 +1,158 @@
+//! Per-tick audit: spawn `claude -p ...` against the memory-manager subagent.
+//!
+//! No SDK dependency — we shell out to the installed `claude` CLI. The CLI
+//! handles auth (subscription session via $CLAUDE_CONFIG_DIR), agents in
+//! `.claude/agents/`, skills in `.claude/skills/`, and MCP wiring. That keeps
+//! the daemon tiny and lets the user upgrade `claude` independently.
+
+use crate::config::Config;
+use crate::memory::MemoryStat;
+use anyhow::{Context, Result};
+use std::path::Path;
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+use tracing::{info, warn};
+
+pub struct TickOutcome {
+    pub ran: bool,
+    pub reason_skipped: Option<String>,
+    pub exit_code: Option<i32>,
+}
+
+pub async fn run(cfg: &Config, mem: &MemoryStat) -> Result<TickOutcome> {
+    // Coordination guards — never race a live session.
+    let live = crate::process::find_claude_sessions();
+    // The daemon itself may spawn a `claude` subprocess, which is fine — but
+    // any OTHER claude/cli must mean a human-driven session, so we yield.
+    let other_sessions = live.len();
+    if other_sessions > 0 {
+        return Ok(TickOutcome {
+            ran: false,
+            reason_skipped: Some(format!("{other_sessions} live claude session(s) detected")),
+            exit_code: None,
+        });
+    }
+
+    if mem.idle_sec < cfg.min_idle.as_secs() {
+        return Ok(TickOutcome {
+            ran: false,
+            reason_skipped: Some(format!(
+                "memory dir mutated {}s ago (< MIN_IDLE_SEC={})",
+                mem.idle_sec, cfg.min_idle.as_secs()
+            )),
+            exit_code: None,
+        });
+    }
+
+    let prompt = build_prompt(cfg);
+    info!(dry_run = cfg.dry_run, model = %cfg.model, "spawning claude CLI for tick");
+
+    let mut cmd = Command::new(&cfg.claude_bin);
+    cmd.arg("-p")
+        .arg(&prompt)
+        .arg("--model").arg(&cfg.model)
+        .arg("--output-format").arg("stream-json")
+        .arg("--include-partial-messages")
+        .arg("--max-turns").arg(cfg.max_turns.to_string())
+        .arg("--verbose")
+        // Working directory = repo root so .claude/agents and .claude/skills resolve.
+        .current_dir(cwd_or_repo()?)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+
+    // Tools — when DRY_RUN, deny mutators.
+    let allow = if cfg.dry_run {
+        "Read,Glob,Grep,Bash(find:*),Bash(ps:*)"
+    } else {
+        "Read,Write,Edit,Glob,Grep,Bash(find:*),Bash(ps:*)"
+    };
+    cmd.arg("--allowed-tools").arg(allow);
+
+    if let Some(dir) = &cfg.claude_config_dir {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
+
+    let mut child = cmd.spawn().with_context(|| format!("spawn {}", cfg.claude_bin))?;
+    let stdout = child.stdout.take().context("claude stdout missing")?;
+    let stderr = child.stderr.take().context("claude stderr missing")?;
+
+    let stdout_task = tokio::spawn(stream_lines("stdout", stdout, true));
+    let stderr_task = tokio::spawn(stream_lines("stderr", stderr, false));
+
+    let status = child.wait().await?;
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+
+    if !status.success() {
+        warn!(code = ?status.code(), "claude exited non-zero");
+    }
+    Ok(TickOutcome { ran: true, reason_skipped: None, exit_code: status.code() })
+}
+
+fn build_prompt(cfg: &Config) -> String {
+    format!(
+"You are the memory-manager daemon tick agent.
+
+MEMORY_ROOT: {memory_root}
+DRY_RUN: {dry_run}
+
+Procedure:
+1. Inventory MEMORY_ROOT (one Glob + Read pass — no recursion outside).
+2. Audit MEMORY.md: line count, dangling entries, missing entries.
+3. Audit each *.md: frontmatter validity, [[wikilink]] integrity, duplicates,
+   missing **Why:** / **How to apply:** lines on feedback/project entries.
+4. If DRY_RUN=true, REPORT proposed changes only. Do not Edit or Write.
+   If DRY_RUN=false, apply at most THREE targeted Edits this tick.
+5. End with exactly: 'files=N issues=N applied=N deferred=N — <one-line narrative>'.
+
+Hard rules:
+- Never write outside MEMORY_ROOT.
+- Never delete files; empty their body and prefix description with '[pruned]'.
+- If anything looks like a secret, stop and report. Do not log the value.",
+        memory_root = cfg.memory_root.display(),
+        dry_run = cfg.dry_run,
+    )
+}
+
+fn cwd_or_repo() -> Result<std::path::PathBuf> {
+    // Daemon is launched from the repo root by start.sh / systemd.
+    Ok(std::env::current_dir()?)
+}
+
+async fn stream_lines<R: tokio::io::AsyncRead + Unpin>(tag: &'static str, reader: R, parse_json: bool) {
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if parse_json {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(role) = v.get("type").and_then(|x| x.as_str()) {
+                    let preview = v.get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.get(0))
+                        .and_then(|b| b.get("text"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+                    let snippet: String = preview.chars().take(220).collect();
+                    if !snippet.is_empty() {
+                        info!(stream = tag, role, "{}", snippet);
+                    }
+                    continue;
+                }
+            }
+        }
+        info!(stream = tag, "{}", line);
+    }
+}
+
+/// Static check — used by `cmmd doctor`.
+pub fn claude_bin_available(claude_bin: &str) -> bool {
+    if Path::new(claude_bin).is_absolute() {
+        return Path::new(claude_bin).exists();
+    }
+    std::process::Command::new("which")
+        .arg(claude_bin)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}

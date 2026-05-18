@@ -1,18 +1,18 @@
 [Unit]
-Description=Claude Memory Manager Daemon
-Documentation=https://github.com/NagyVikt/claude-memory-manager-daemon
+Description=Claude Memory Manager Daemon (Rust)
+Documentation=https://github.com/recodeee/claude-memory-manager-daemon
 After=default.target
 
 [Service]
 Type=simple
 WorkingDirectory=%h/Documents/claude-memory-manager-daemon
-ExecStart=/usr/bin/env bun run src/daemon.ts
+ExecStart=%h/Documents/claude-memory-manager-daemon/target/release/cmmd run
 Restart=on-failure
 RestartSec=30
 Environment=DRY_RUN=true
 StandardOutput=append:%t/claude-memory-manager.log
 StandardError=append:%t/claude-memory-manager.log
-# Hardening — daemon only needs read on $HOME for memory + write on /tmp + write on memory dir
+# Hardening — daemon needs read on $HOME, write on memory dir + /tmp.
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=%h/.claude/projects/-home-deadpool/memory /tmp
@@ -22,7 +22,8 @@ NoNewPrivileges=true
 [Install]
 WantedBy=default.target
 
-# Install as user service:
+# Install:
+#   cargo build --release
 #   mkdir -p ~/.config/systemd/user
 #   cp systemd/claude-memory-manager.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload

@@ -1,112 +1,181 @@
 # claude-memory-manager-daemon
 
-A long-running Claude Code agent that tends the **file-based memory lane**
-(`~/.claude/projects/-home-deadpool/memory/`) in a real-time loop while
-watching the local system process table.
+A Rust daemon that tends the Claude Code **file-based memory lane**
+(`~/.claude/projects/-home-deadpool/memory/`) in a real-time tick loop,
+while continuously surfacing **authmux** login state and the local Claude
+account directory tree.
 
-Think of it as a janitor process for your Claude memory:
+It does NOT manage system RAM. It is a **janitor process** for your
+Claude memory + a **live view** of which Claude accounts are logged in.
 
-- Keeps `MEMORY.md` tidy and under the 200-line truncation threshold
-- Prunes stale entries that no longer match what's on disk
-- Detects duplicates and merges them
-- Re-organizes entries by topic (user / feedback / project / reference)
-- Surfaces what Claude Code sessions are currently running so it never
-  rewrites a file another live session has touched
+## Why Rust
 
-It is **NOT** a system-memory (RAM) optimizer. The process viewer is only
-used to coordinate with other Claude sessions — never to kill processes.
+Compared to the original TypeScript draft:
+
+- **~5 MB RSS** vs ~100 MB for Bun/Node. This thing runs 24/7.
+- **Single static binary** (`cargo build --release`) — no `bun`/`node` on the host.
+- **No SDK lock-in**: shells out to the official `claude` CLI per tick. When
+  you upgrade `claude`, the daemon upgrades for free. Auth, agents, skills,
+  and MCP wiring stay handled by the CLI.
+- **Strong types** for the daemon state shared across the loop and the
+  `mmctl` companion CLI.
+
+## Two binaries
+
+| Binary  | Path                | Purpose |
+| ------- | ------------------- | ------- |
+| `cmmd`  | `target/.../cmmd`   | the daemon itself; subcommands `run` (default) and `doctor` |
+| `mmctl` | `target/.../mmctl`  | live status client over a Unix socket: `status`, `accounts`, `memory`, `last-tick`, `ping` |
 
 ## Architecture
 
 ```
-                   ┌──────────────────────────────────┐
-                   │ claude-memory-manager-daemon     │
-                   │                                  │
-                   │  ┌────────────────────────────┐  │
-                   │  │ daemon loop (src/daemon.ts)│  │
-                   │  └─────────────┬──────────────┘  │
-                   │                │ spawns          │
-                   │  ┌─────────────▼──────────────┐  │
-                   │  │ Claude Agent SDK query()   │  │
-                   │  │  - memory-manager subagent │  │
-                   │  │  - mcp: process-server     │  │
-                   │  │  - skills/*                │  │
-                   │  └────────────────────────────┘  │
-                   └──────────────────────────────────┘
-                                 │
-                                 ▼
-              ┌──────────────────────────────────────┐
-              │ ~/.claude/projects/-home-deadpool/   │
-              │   memory/   (file-based lane)        │
-              │     ├── MEMORY.md      (index)       │
-              │     └── *.md           (entries)     │
-              └──────────────────────────────────────┘
+                        ┌──────────────────────────────────────┐
+                        │            cmmd (Rust)              │
+                        │                                      │
+                        │  ┌────────────────────────────────┐  │
+                        │  │ main loop (src/main.rs)        │  │
+                        │  │                                │  │
+                        │  │  every tick:                   │  │
+                        │  │    1. authmux::snapshot()      │──┼──▶ `authmux list/current/status`
+                        │  │    2. memory::stat()           │  │
+                        │  │    3. process::find_claude…()  │  │
+                        │  │    4. spawn `claude -p …`      │──┼──▶ `claude` CLI (subprocess)
+                        │  └────────────────────────────────┘  │
+                        │                                      │
+                        │  ┌────────────────────────────────┐  │
+                        │  │ Unix socket: $STATUS_SOCK      │◀─┼── mmctl status
+                        │  └────────────────────────────────┘  │
+                        └──────────────────────────────────────┘
+                                       │
+                                       ▼
+                        ┌──────────────────────────────────────┐
+                        │ ~/.claude/projects/-home-deadpool/   │
+                        │   memory/   (file-based lane)        │
+                        └──────────────────────────────────────┘
 ```
 
-## Components
+## What "always shows users are logged in" means
+
+Every tick, before anything else, the daemon:
+
+1. Calls `authmux current` → active account (the row prefixed with `*`).
+2. Calls `authmux list`    → all managed accounts with `5h=` / `weekly=` usage %.
+3. Calls `authmux status`  → auto-switch on/off + service state.
+4. Walks `~/.claude-accounts/` and counts which `account*/` dirs have a
+   `.credentials.json` (so even if `authmux` is missing, you still see what
+   Claude Code accounts are provisioned locally).
+
+This snapshot is held in shared state. Run `mmctl accounts` at any moment
+to see it:
+
+```
+$ mmctl accounts
+{
+  "binary": "authmux",
+  "available": true,
+  "current": "odin@kollarrobert.sk",
+  "accounts": [
+    { "email": "admin@kollarrobert.sk", "kind": "ChatGPT seat (Business)",
+      "five_h_pct": 98, "weekly_pct": 100, "active": false },
+    ...
+  ],
+  "auto_switch": "OFF",
+  "service_state": "inactive"
+}
+```
+
+The daemon also emits a one-line login summary into the log every tick:
+
+```
+2026-05-18T11:04:12Z INFO login snapshot authmux_available=true
+  authmux_active=odin@kollarrobert.sk authmux_total=23
+  claude_account_dirs_with_creds=2
+```
+
+## Files
 
 | Path | Purpose |
 | --- | --- |
-| `src/daemon.ts` | Long-running loop. Calls the Claude Agent SDK once per tick. |
-| `src/process-watcher.ts` | Snapshot of `claude` / `node` / `bun` processes so the agent can coordinate. |
-| `mcp/process-server.ts` | MCP stdio server. Exposes `list_processes`, `find_claude_sessions`, `memory_dir_stat`. |
-| `.claude/agents/memory-manager.md` | Subagent prompt the daemon loop calls. |
-| `.claude/skills/memory-audit/` | Skill: read every memory file, flag staleness / dup. |
-| `.claude/skills/memory-prune/` | Skill: remove entries the user agreed are stale. |
-| `.claude/skills/memory-organize/` | Skill: rewrite `MEMORY.md` so it stays under 200 lines. |
-| `scripts/start.sh` | Start the daemon detached, write pid to `/tmp/claude-memory-manager.pid`. |
-| `scripts/stop.sh` | Stop via pid file. |
-| `scripts/status.sh` | Show pid, uptime, last tick. |
-| `systemd/claude-memory-manager.service` | Optional user-level systemd unit. |
+| `src/main.rs`        | daemon entry, tick loop, signal handling |
+| `src/lib.rs`         | re-exports modules to both binaries |
+| `src/config.rs`      | env → typed `Config`, supports `.env` |
+| `src/authmux.rs`     | `authmux list/current/status` parser + `~/.claude-accounts` scanner |
+| `src/process.rs`     | `sysinfo` snapshot, `find_claude_sessions` |
+| `src/memory.rs`      | file count / total bytes / newest mtime for `MEMORY_ROOT` |
+| `src/tick.rs`        | spawns `claude -p ...`, streams `stream-json` lines into the log |
+| `src/ipc.rs`         | PID lock + Unix-socket status server / client |
+| `src/bin/mmctl.rs`   | companion CLI |
+| `.claude/agents/memory-manager.md` | per-tick subagent prompt |
+| `.claude/skills/{memory-audit,memory-prune,memory-organize}` | three skills |
+| `scripts/{start,stop,status}.sh` | local lifecycle |
+| `systemd/claude-memory-manager.service` | optional user-level systemd unit |
 
-## Configuration
-
-Set in `.env` (gitignored):
-
-```
-MEMORY_ROOT=/home/deadpool/.claude/projects/-home-deadpool/memory
-TICK_INTERVAL_SEC=900           # 15 minutes between audits
-ANTHROPIC_API_KEY=...           # if not using subscription auth
-DRY_RUN=true                    # safety default — agent reports, does not write
-MODEL=claude-haiku-4-5-20251001 # cheap default for the loop
-LOG_FILE=/tmp/claude-memory-manager.log
-```
-
-## Install
+## Build
 
 ```
-cd ~/Documents/claude-memory-manager-daemon
-bun install
+cargo build --release
+# → target/release/cmmd
+# → target/release/mmctl
 ```
 
-## Run (foreground, dry-run)
+## Run
+
+Foreground, one-shot, dry-run:
 
 ```
-DRY_RUN=true bun run src/daemon.ts
+./target/release/cmmd run --once
 ```
 
-## Run (detached)
+Foreground, looping, dry-run (Ctrl-C to stop):
+
+```
+./target/release/cmmd run
+```
+
+Detached:
 
 ```
 ./scripts/start.sh
-./scripts/status.sh
+./scripts/status.sh        # uses mmctl for live state
 ./scripts/stop.sh
+```
+
+Resolved config + one-shot snapshot, no daemon:
+
+```
+./target/release/cmmd doctor
+```
+
+Live queries against the running daemon:
+
+```
+./target/release/mmctl status      # full JSON snapshot
+./target/release/mmctl accounts    # authmux block only
+./target/release/mmctl memory      # MEMORY_ROOT stat only
+./target/release/mmctl last-tick   # last tick record
+./target/release/mmctl ping        # liveness
 ```
 
 ## Safety defaults
 
-- **DRY_RUN=true** is the shipped default. The agent reports proposed
-  changes to the log file; it does not mutate memory until you set
-  `DRY_RUN=false`.
-- The MCP server is **read-only**. It cannot kill, signal, or modify
-  any process — only enumerate them.
-- The daemon never touches Colony hivemind state or the `claude-mem`
-  database. Per `~/.claude/CLAUDE.md`, those lanes are owned by their
-  respective systems.
-- A lockfile at `/tmp/claude-memory-manager.lock` prevents two daemons
-  from running at once.
+- **`DRY_RUN=true`** is shipped in `.env.example` and the systemd unit. The
+  agent reports proposed changes to the log; no writes until you flip to
+  `false`.
+- Tick **aborts** if any non-daemon `claude` / `claude-cli` / `kiro-cli`
+  process is running. Never races a live session.
+- Tick **aborts** if `MEMORY_ROOT` was touched < `MIN_IDLE_SEC` (300 s
+  default) ago.
+- MCP / tool surface is **read-only** when `DRY_RUN=true` (allowedTools =
+  `Read,Glob,Grep,Bash(find:*),Bash(ps:*)` — no Write/Edit).
+- Lockfile prevents two daemons from running at once.
+- Per `~/.claude/CLAUDE.md`, the daemon **never** touches the `claude-mem`
+  database or Colony hivemind. Those lanes own themselves.
 
 ## Status
 
-Pre-alpha scaffold. Run with `DRY_RUN=true` and read the log before
-trusting it with writes.
+Pre-alpha. The Rust scaffold compiles in theory — verify with
+`cargo check` before relying on it. The skills under `.claude/skills/`
+are markdown specs only; the agent inside `claude` interprets them. The
+auditing logic itself runs inside the spawned `claude` process, so the
+daemon is intentionally thin.

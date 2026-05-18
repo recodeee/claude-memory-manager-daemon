@@ -1,6 +1,4 @@
-node_modules/
+target/
 .env
 *.log
-dist/
-bun.lockb
 .claude/settings.local.json
