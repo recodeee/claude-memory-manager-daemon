@@ -105,12 +105,28 @@ pub fn find_orphans() -> Vec<OrphanProc> {
 }
 
 /// Kill orphaned node processes. Returns what was reaped.
-pub fn reap_orphans() -> ReapResult {
+///
+/// `dry_run=true` reports candidates without sending SIGTERM. The returned
+/// `reaped` list represents what *would* have been killed — operators can
+/// inspect it via the new `cmmd_housekeeper_kills_total{kind="orphan_node"}`
+/// counter and the daemon log to validate the pattern set before enabling
+/// real kills.
+pub fn reap_orphans(dry_run: bool) -> ReapResult {
     let orphans = find_orphans();
     let scanned = orphans.len();
     let mut reaped = Vec::new();
 
     for proc in orphans {
+        if dry_run {
+            info!(
+                pid = proc.pid,
+                rss_kb = proc.rss_kb,
+                cmd = %proc.cmdline.chars().take(80).collect::<String>(),
+                "dry-run: would reap orphan node process"
+            );
+            reaped.push(proc);
+            continue;
+        }
         let pid = Pid::from_raw(proc.pid as i32);
         if kill(pid, Signal::SIGTERM).is_ok() {
             info!(

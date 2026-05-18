@@ -78,8 +78,10 @@ pub struct MemoryHolder {
 /// Implementation: shells out to `lsof +D <memory_root>`. If lsof is missing
 /// or fails, returns `Err` so the caller can decide whether to fall back to
 /// the conservative process-name guard.
+///
+/// Sync variant — kept for non-async callers (`cmmd doctor`, tests). The
+/// hot path (`tick::run`) uses the async timeout-wrapped version below.
 pub fn memory_holders(memory_root: &Path) -> Result<Vec<MemoryHolder>, String> {
-    let me = std::process::id();
     let out = Command::new("lsof")
         .arg("-F")
         .arg("pcn") // machine-readable: p=pid c=cmd n=name
@@ -88,8 +90,48 @@ pub fn memory_holders(memory_root: &Path) -> Result<Vec<MemoryHolder>, String> {
         .output()
         .map_err(|e| format!("lsof spawn failed: {e}"))?;
     // lsof returns 1 when there are no matching files — that's success-with-zero-results.
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(parse_lsof_pcn(&String::from_utf8_lossy(&out.stdout)))
+}
 
+/// Same as [`memory_holders`] but spawns lsof under a wall-clock timeout. If
+/// lsof doesn't return within `timeout_secs`, the spawned process is killed
+/// and `Err("lsof timeout")` is returned so the caller can fall back to the
+/// conservative process-name guard.
+///
+/// This exists because the blocking lsof recursively walks `memory_root`;
+/// on a slow filesystem (sshfs, network mount) it can hang for the lifetime
+/// of the tick and wedge every subsequent iteration. The 0-timeout variant
+/// is preserved for parity with the sync function.
+pub async fn memory_holders_with_timeout(
+    memory_root: &Path,
+    timeout_secs: u64,
+) -> Result<Vec<MemoryHolder>, String> {
+    if timeout_secs == 0 {
+        // Opt-out path: behave exactly like the sync version. Useful for
+        // operators who can't tolerate the kill-on-deadline behavior.
+        return memory_holders(memory_root);
+    }
+    let dur = std::time::Duration::from_secs(timeout_secs);
+    let mut cmd = tokio::process::Command::new("lsof");
+    cmd.arg("-F")
+        .arg("pcn")
+        .arg("+D")
+        .arg(memory_root)
+        .kill_on_drop(true);
+    let fut = cmd.output();
+    let out = match tokio::time::timeout(dur, fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("lsof spawn failed: {e}")),
+        Err(_) => return Err(format!("lsof timeout after {timeout_secs}s")),
+    };
+    Ok(parse_lsof_pcn(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Parse the `lsof -F pcn` machine-readable format. Lifted out so both the
+/// sync and async variants share the same parser — easier to test, easier to
+/// keep in sync if the lsof flags change.
+fn parse_lsof_pcn(stdout: &str) -> Vec<MemoryHolder> {
+    let me = std::process::id();
     let mut holders: Vec<MemoryHolder> = Vec::new();
     let mut cur_pid: Option<u32> = None;
     let mut cur_name: Option<String> = None;
@@ -109,5 +151,39 @@ pub fn memory_holders(memory_root: &Path) -> Result<Vec<MemoryHolder>, String> {
             }
         }
     }
-    Ok(holders)
+    holders
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_lsof_skips_self_pid() {
+        let me = std::process::id();
+        let other = me + 1;
+        let body = format!("p{me}\nccmd-self\nn/x\np{other}\nccmd-other\nn/y\n");
+        let h = parse_lsof_pcn(&body);
+        assert_eq!(h.len(), 1, "self pid filtered: got {:?}", h);
+        assert_eq!(h[0].pid, other);
+        assert_eq!(h[0].name, "cmd-other");
+    }
+
+    #[test]
+    fn parse_lsof_dedupes_repeated_pid() {
+        let other = std::process::id() + 99;
+        let body = format!(
+            "p{other}\ncfoo\nn/a\np{other}\ncfoo\nn/b\np{other}\ncfoo\nn/c\n"
+        );
+        let h = parse_lsof_pcn(&body);
+        assert_eq!(h.len(), 1, "duplicate pid coalesced");
+    }
+
+    #[tokio::test]
+    async fn memory_holders_zero_timeout_falls_back_to_sync() {
+        // Smoke test: zero timeout means "behave like the sync call".
+        // We pass /tmp which always exists; we don't care about the result,
+        // only that the function returns without hanging.
+        let _ = memory_holders_with_timeout(std::path::Path::new("/tmp"), 0).await;
+    }
 }

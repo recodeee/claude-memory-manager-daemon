@@ -216,7 +216,9 @@ fn run_orphan_node(action: OrphanNodeAction) -> Result<()> {
             Ok(())
         }
         OrphanNodeAction::Reap { json } => {
-            let result = orphan_node::reap_orphans();
+            // CLI invocation = explicit operator action; honor with real kills.
+            // For dry-run behavior in the daemon tick, see HOUSEKEEPER_DRY_RUN.
+            let result = orphan_node::reap_orphans(false);
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
@@ -237,7 +239,8 @@ fn run_orphan_node(action: OrphanNodeAction) -> Result<()> {
 fn run_tmux_janitor(action: TmuxAction) -> Result<()> {
     match action {
         TmuxAction::Cleanup { json } => {
-            let result = tmux_janitor::cleanup_unattached();
+            // CLI invocation = explicit operator action.
+            let result = tmux_janitor::cleanup_unattached(false);
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
@@ -253,7 +256,8 @@ fn run_tmux_janitor(action: TmuxAction) -> Result<()> {
 
 fn run_pressure(respond: bool, json: bool) -> Result<()> {
     let result = if respond {
-        pressure::check_and_respond()
+        // CLI invocation = explicit operator action.
+        pressure::check_and_respond(false)
     } else {
         pressure::PressureResponse {
             mem: pressure::read_meminfo(),
@@ -637,7 +641,12 @@ async fn run_doctor(cfg: config::Config) -> Result<()> {
 }
 
 async fn run_daemon(cfg: config::Config, once: bool) -> Result<()> {
-    ipc::acquire_lock(&cfg.lock_file, &cfg.pid_file)?;
+    // RAII flock guard — kept alive for the lifetime of run_daemon. The flock
+    // is what guarantees only one cmmd can pass this point; the path-based
+    // probe before it was racy (two daemons could both pass the existence
+    // check). On Drop, the guard removes the lock + pid files; on crash, the
+    // kernel releases the flock automatically.
+    let _lock = ipc::acquire_lock(&cfg.lock_file, &cfg.pid_file)?;
     info!(
         pid = std::process::id(),
         memory = %cfg.memory_root.display(),
@@ -717,7 +726,8 @@ async fn run_daemon(cfg: config::Config, once: bool) -> Result<()> {
     )
     .await;
 
-    ipc::release_lock(&cfg_arc.lock_file, &cfg_arc.pid_file);
+    // _lock drops here -> removes lock + pid files, releases flock.
+    drop(_lock);
     info!("daemon down");
     result
 }
@@ -789,25 +799,41 @@ async fn main_loop(
         log_login_summary(&am, &accts);
 
         // --- Housekeeping: run every tick regardless of memory-manager logic ---
+        // HOUSEKEEPER_DRY_RUN flips all three into report-only mode so an
+        // operator can watch what *would* be killed before promoting to real
+        // signals. The counts are recorded into cmmd_housekeeper_actions_total
+        // (mode="real" vs mode="dry_run") so dashboards can compare.
+        let hk_dry = cfg.housekeeper_dry_run;
         // 1. Kill orphaned tmux sessions
-        let tmux_result = tmux_janitor::cleanup_unattached();
+        let tmux_result = tmux_janitor::cleanup_unattached(hk_dry);
         if !tmux_result.killed.is_empty() {
-            info!(killed = ?tmux_result.killed, "tmux janitor");
+            info!(killed = ?tmux_result.killed, dry_run = hk_dry, "tmux janitor");
         }
         // 2. Reap orphaned node processes (mcpvault, mcp-server, worker-service)
-        let orphan_result = orphan_node::reap_orphans();
+        let orphan_result = orphan_node::reap_orphans(hk_dry);
         if !orphan_result.reaped.is_empty() {
-            info!(count = orphan_result.reaped.len(), "orphan node reaper");
+            info!(
+                count = orphan_result.reaped.len(),
+                dry_run = hk_dry,
+                "orphan node reaper"
+            );
         }
         // 3. RAM pressure response
-        let pressure_result = pressure::check_and_respond();
+        let pressure_result = pressure::check_and_respond(hk_dry);
         if pressure_result.threshold_exceeded {
             info!(
                 used_pct = pressure_result.mem.used_pct,
                 actions = ?pressure_result.actions_taken,
+                dry_run = hk_dry,
                 "pressure response"
             );
         }
+        metrics_handle.record_housekeeper(
+            hk_dry,
+            tmux_result.killed.len() as u64,
+            orphan_result.reaped.len() as u64,
+            pressure_result.actions_taken.len() as u64,
+        );
 
         let dry_run_now = *dry_run_runtime.lock().await;
         state.write().await.dry_run = dry_run_now;

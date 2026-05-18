@@ -47,7 +47,11 @@ pub async fn run(
     // Strategy: ask lsof which (foreign) PIDs currently hold a file under
     // memory_root open. If lsof is unavailable, fall back to the conservative
     // process-name guard (any other claude/kiro process aborts the tick).
-    match crate::process::memory_holders(memory_root) {
+    //
+    // The lsof call is bounded by `cfg.lsof_timeout_sec` — on a slow FS it
+    // would otherwise hang the whole tick. On timeout, treat it the same as
+    // "lsof unavailable" and fall back to the name-only guard.
+    match crate::process::memory_holders_with_timeout(memory_root, cfg.lsof_timeout_sec).await {
         Ok(holders) if !holders.is_empty() => {
             let names: Vec<String> = holders
                 .iter()

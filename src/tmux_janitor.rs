@@ -50,12 +50,21 @@ fn list_sessions() -> Vec<TmuxSession> {
 
 /// Kill unattached sessions matching the `term-*` pattern.
 /// These are auto-created by .bashrc and should die when the window closes.
-pub fn cleanup_unattached() -> CleanupResult {
+///
+/// When `dry_run` is true, the function still enumerates matching sessions
+/// and reports them via the returned `killed` list (operator-facing: "would
+/// have killed these") but does NOT actually send the kill-session command.
+pub fn cleanup_unattached(dry_run: bool) -> CleanupResult {
     let sessions = list_sessions();
     let mut killed = Vec::new();
 
     for sess in &sessions {
         if !sess.attached && sess.name.starts_with("term-") {
+            if dry_run {
+                info!(session = %sess.name, "dry-run: would kill unattached tmux session");
+                killed.push(sess.name.clone());
+                continue;
+            }
             let status = Command::new("tmux")
                 .args(["kill-session", "-t", &sess.name])
                 .status();

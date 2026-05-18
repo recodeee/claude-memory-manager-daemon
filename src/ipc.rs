@@ -5,7 +5,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -34,39 +35,113 @@ pub struct TickRecord {
     pub exit_code: Option<i32>,
 }
 
-pub fn acquire_lock(lock_file: &Path, pid_file: &Path) -> Result<()> {
-    if lock_file.exists() {
-        let pid_str = std::fs::read_to_string(lock_file).unwrap_or_default();
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            // signal 0 = existence probe
-            if unsafe { libc_kill(pid, 0) } == 0 {
-                return Err(anyhow!(
-                    "another daemon holds {} (pid={})",
-                    lock_file.display(),
-                    pid
-                ));
-            }
-        }
-        let _ = std::fs::remove_file(lock_file);
+/// RAII guard for the daemon's exclusive process-singleton lock.
+///
+/// Two-line summary of how this defeats the old race:
+///   1. The lock is acquired with `flock(LOCK_EX|LOCK_NB)` on an *fd we hold*.
+///      Kernel guarantees only one fd at a time can hold the exclusive lock,
+///      so two cmmd processes can't both pass startup, even if they call
+///      `acquire_lock` at the same microsecond.
+///   2. On crash, the kernel closes our fd and releases the lock for us. No
+///      stale-lock-file false positives, no PID-recycle ambiguity.
+///
+/// On Drop the guard removes the lock_file and pid_file. The fd is dropped
+/// last, which is when the kernel releases the actual lock.
+#[derive(Debug)]
+pub struct LockGuard {
+    lock_file: PathBuf,
+    pid_file: PathBuf,
+    // Held for the lifetime of the daemon. The fd's close releases the flock.
+    // Keep this *after* the path fields so Drop runs lock_file/pid_file
+    // removal before the fd close — that ordering avoids a tiny window in
+    // which another daemon could see the file gone and re-acquire while our
+    // fd is still in close().
+    _fd: std::fs::File,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_file);
+        let _ = std::fs::remove_file(&self.pid_file);
+        // _fd dropped here -> kernel releases the flock.
     }
-    let me = std::process::id();
-    std::fs::write(lock_file, me.to_string())
+}
+
+/// Acquire the daemon singleton lock.
+///
+/// Uses `flock(LOCK_EX|LOCK_NB)` on the lock file's fd. If the lock is held
+/// by another live daemon, returns an Err that includes the holding PID
+/// (read from the file body) for operator clarity. The flock is what makes
+/// this race-free; the PID readback is purely cosmetic.
+pub fn acquire_lock(lock_file: &Path, pid_file: &Path) -> Result<LockGuard> {
+    if let Some(parent) = lock_file.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    // Open-or-create with read-write so we can flock + truncate + write the
+    // current pid. We do NOT use create_new(true) because that prevents
+    // re-acquiring after a clean shutdown left the file behind (intentional —
+    // the file is a marker, the flock is the actual lock).
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_file)
+        .with_context(|| format!("open {}", lock_file.display()))?;
+
+    let fd = file.as_raw_fd();
+    // Non-blocking exclusive flock. If anyone else holds it, EWOULDBLOCK.
+    let rc = unsafe { libc_flock(fd, LOCK_EX | LOCK_NB) };
+    if rc != 0 {
+        // Best-effort read of the previous holder's PID for the error message.
+        // This is purely informational — flock already told us the truth.
+        let pid_hint = std::fs::read_to_string(lock_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        return Err(match pid_hint {
+            Some(p) => anyhow!(
+                "another daemon holds {} (pid={p})",
+                lock_file.display(),
+            ),
+            None => anyhow!(
+                "another daemon holds {} (pid unknown)",
+                lock_file.display(),
+            ),
+        });
+    }
+
+    // We hold the lock. Stamp our pid into both files.
+    let me = std::process::id().to_string();
+    use std::io::{Seek, SeekFrom, Write};
+    let mut f = file;
+    f.set_len(0)
+        .with_context(|| format!("truncate {}", lock_file.display()))?;
+    f.seek(SeekFrom::Start(0))
+        .with_context(|| format!("seek {}", lock_file.display()))?;
+    f.write_all(me.as_bytes())
         .with_context(|| format!("write {}", lock_file.display()))?;
-    std::fs::write(pid_file, me.to_string())
+    f.sync_all()
+        .with_context(|| format!("sync {}", lock_file.display()))?;
+
+    std::fs::write(pid_file, &me)
         .with_context(|| format!("write {}", pid_file.display()))?;
-    Ok(())
+
+    Ok(LockGuard {
+        lock_file: lock_file.to_path_buf(),
+        pid_file: pid_file.to_path_buf(),
+        _fd: f,
+    })
 }
 
-pub fn release_lock(lock_file: &Path, pid_file: &Path) {
-    let _ = std::fs::remove_file(lock_file);
-    let _ = std::fs::remove_file(pid_file);
-}
-
+// flock(2) is not in libc-side `nix` crate without the "fs" feature, so we
+// declare the syscall directly. This is portable Linux/macOS — no surprises.
+const LOCK_EX: i32 = 2;
+const LOCK_NB: i32 = 4;
 extern "C" {
-    fn kill(pid: i32, sig: i32) -> i32;
+    fn flock(fd: i32, operation: i32) -> i32;
 }
-unsafe fn libc_kill(pid: i32, sig: i32) -> i32 {
-    kill(pid, sig)
+unsafe fn libc_flock(fd: i32, op: i32) -> i32 {
+    flock(fd, op)
 }
 
 /// Daemon-side handles exposed to clients via the Unix socket.
@@ -172,4 +247,59 @@ pub async fn query_status(sock_path: &Path) -> Result<DaemonStatus> {
 #[allow(dead_code)]
 fn _suppress() -> anyhow::Error {
     anyhow!("unused")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_tmp(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("cmmd-ipc-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn second_acquire_fails_while_first_held() {
+        let dir = unique_tmp("flock-double");
+        let lock = dir.join("daemon.lock");
+        let pid = dir.join("daemon.pid");
+        let first = acquire_lock(&lock, &pid).expect("first acquire");
+        let second = acquire_lock(&lock, &pid);
+        assert!(second.is_err(), "second acquire must fail while first held");
+        let msg = format!("{}", second.unwrap_err());
+        assert!(
+            msg.contains("another daemon holds"),
+            "error mentions the lock collision: {msg}"
+        );
+        drop(first);
+        // After drop the lock + pid files should be gone.
+        assert!(!lock.exists(), "lock file removed on drop");
+        assert!(!pid.exists(), "pid file removed on drop");
+    }
+
+    #[test]
+    fn third_acquire_succeeds_after_first_dropped() {
+        let dir = unique_tmp("flock-reacquire");
+        let lock = dir.join("daemon.lock");
+        let pid = dir.join("daemon.pid");
+        {
+            let _g = acquire_lock(&lock, &pid).expect("first");
+        }
+        // Once the first guard is dropped, a fresh acquire must work — this
+        // is the "stale lock file" case that used to require a process probe.
+        let _g2 = acquire_lock(&lock, &pid).expect("reacquire after drop");
+    }
+
+    #[test]
+    fn pid_file_contains_current_process_id() {
+        let dir = unique_tmp("flock-pid");
+        let lock = dir.join("daemon.lock");
+        let pid = dir.join("daemon.pid");
+        let _g = acquire_lock(&lock, &pid).expect("acquire");
+        let written = std::fs::read_to_string(&pid).unwrap();
+        let want = std::process::id().to_string();
+        assert_eq!(written.trim(), want);
+    }
 }

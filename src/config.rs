@@ -39,6 +39,17 @@ pub struct Config {
     /// Cadence for `git gc --prune=now --aggressive` over each MEMORY_ROOT.
     /// 0 = disabled.
     pub git_gc_interval_days: u64,
+    /// Wall-clock cap for the `lsof +D <memory_root>` probe used to detect
+    /// live editors. A slow filesystem (sshfs, network mount) could hang the
+    /// blocking lsof and wedge the whole tick; this kills it instead.
+    /// 0 = disabled (use the old unbounded blocking call).
+    pub lsof_timeout_sec: u64,
+    /// Run housekeepers (tmux_janitor, orphan_node, pressure) in
+    /// report-only mode — log what *would* be killed without actually
+    /// sending signals. Same intent as DRY_RUN but scoped to housekeepers
+    /// so the memory-manager loop can still mutate while housekeepers stay
+    /// silent.
+    pub housekeeper_dry_run: bool,
     pub claude_bin: String,
     pub authmux_bin: String,
     pub claude_accounts_dir: PathBuf,
@@ -96,6 +107,8 @@ impl Config {
             history_max_lines: env_u64("HISTORY_MAX_LINES", 10_000),
             tick_log_ttl_days: env_u64("TICK_LOG_TTL_DAYS", 7),
             git_gc_interval_days: env_u64("GIT_GC_INTERVAL_DAYS", 7),
+            lsof_timeout_sec: env_u64("LSOF_TIMEOUT_SEC", 5),
+            housekeeper_dry_run: env_bool("HOUSEKEEPER_DRY_RUN", false),
             claude_bin: env_str("CLAUDE_BIN", "claude"),
             authmux_bin: env_str("AUTHMUX_BIN", "authmux"),
             claude_accounts_dir: env_path(
